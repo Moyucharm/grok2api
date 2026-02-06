@@ -302,12 +302,18 @@ async function generateImagineWsWithRetries(args: {
 
     const jwt = chosen.token;
     const cookie = buildGrokCookie(jwt, cf);
+    let calibratedAge = false;
 
     if (autoAgeVerify) {
       const verified = await getTokenAgeVerified(args.env.DB, jwt);
       if (!verified) {
         const ok = await verifyImagineAge({ cookie, birthDate });
-        if (ok) await setTokenAgeVerified(args.env.DB, jwt, true);
+        if (ok) {
+          await setTokenAgeVerified(args.env.DB, jwt, true);
+          calibratedAge = true;
+        }
+      } else {
+        calibratedAge = true;
       }
     }
 
@@ -320,6 +326,10 @@ async function generateImagineWsWithRetries(args: {
         enableNsfw,
         ...(args.onProgress ? { onProgress: args.onProgress } : {}),
       });
+      if (!calibratedAge) {
+        // Fallback calibration: token successfully passed imagine generation path.
+        await setTokenAgeVerified(args.env.DB, jwt, true);
+      }
       return { urls: generated.urls, b64List: generated.b64List, tokenSuffix: jwt.slice(-6) };
     } catch (err) {
       lastError = err;
@@ -384,12 +394,18 @@ async function createImagineVideoUpstreamWithRetries(args: {
     const jwt = chosen.token;
     const cookie = buildGrokCookie(jwt, cf);
     const safePrompt = args.prompt.trim() || "Generate a video";
+    let calibratedAge = false;
 
     if (autoAgeVerify) {
       const verified = await getTokenAgeVerified(args.env.DB, jwt);
       if (!verified) {
         const ok = await verifyImagineAge({ cookie, birthDate });
-        if (ok) await setTokenAgeVerified(args.env.DB, jwt, true);
+        if (ok) {
+          await setTokenAgeVerified(args.env.DB, jwt, true);
+          calibratedAge = true;
+        }
+      } else {
+        calibratedAge = true;
       }
     }
 
@@ -429,7 +445,13 @@ async function createImagineVideoUpstreamWithRetries(args: {
         ...(referer ? { referer } : {}),
       });
 
-      if (upstream.ok) return { upstream, cookie, tokenSuffix: jwt.slice(-6) };
+      if (upstream.ok) {
+        if (!calibratedAge) {
+          // Fallback calibration: token successfully passed imagine video path.
+          await setTokenAgeVerified(args.env.DB, jwt, true);
+        }
+        return { upstream, cookie, tokenSuffix: jwt.slice(-6) };
+      }
 
       const txt = await upstream.text().catch(() => "");
       const msg = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;

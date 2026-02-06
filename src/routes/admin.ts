@@ -20,12 +20,15 @@ import {
   deleteTokens,
   getAllTags,
   listTokens,
+  markTokenRecovered,
+  setTokenAgeVerified,
   tokenRowToInfo,
   updateTokenNote,
   updateTokenTags,
   updateTokenLimits,
 } from "../repo/tokens";
 import { checkRateLimits } from "../grok/rateLimits";
+import { verifyImagineAge } from "../grok/imagineWs";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
 import {
@@ -64,6 +67,14 @@ function formatBytes(sizeBytes: number): string {
 function normalizeSsoToken(raw: string): string {
   const t = (raw || "").trim();
   return t.startsWith("sso=") ? t.slice(4).trim() : t;
+}
+
+function ensureBirthDate(v: string): string {
+  const t = String(v || "").trim();
+  if (!t) return "2001-01-01T16:00:00.000Z";
+  const ms = Date.parse(t);
+  if (!Number.isFinite(ms)) return "2001-01-01T16:00:00.000Z";
+  return new Date(ms).toISOString();
 }
 
 async function clearKvCacheByType(
@@ -316,7 +327,9 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
 adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
   try {
     const rows = await listTokens(c.env.DB);
+    const settings = await getSettings(c.env);
     const now = nowMs();
+    const nsfwRequestEnabled = settings.grok.imagine_enable_nsfw !== false;
 
     const out: Record<"ssoBasic" | "ssoSuper", any[]> = { ssoBasic: [], ssoSuper: [] };
     for (const r of rows) {
@@ -325,6 +338,9 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
       const status = r.status === "expired" ? "invalid" : isCooling ? "cooling" : "active";
       const quotaRaw = r.remaining_queries;
       const quota = quotaRaw >= 0 ? quotaRaw : 0;
+      const ageVerified = Number(r.age_verified ?? 0) > 0;
+      const ageStatus = ageVerified ? "verified" : "unknown";
+      const nsfwStatus = nsfwRequestEnabled ? (ageVerified ? "enabled" : "unknown") : "disabled_by_config";
       out[pool].push({
         token: `sso=${r.token}`,
         status,
@@ -332,6 +348,9 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
         note: r.note ?? "",
         fail_count: r.failed_count ?? 0,
         use_count: 0,
+        age_verified: ageVerified,
+        age_status: ageStatus,
+        nsfw_status: nsfwStatus,
       });
     }
     return c.json(out);
@@ -420,6 +439,8 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
 
     const settings = await getSettings(c.env);
     const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+    const syncAge = body?.sync_age !== false;
+    const birthDate = ensureBirthDate(String(settings.grok.imagine_birth_date ?? ""));
 
     const placeholders = unique.map(() => "?").join(",");
     const typeRows = placeholders
@@ -433,6 +454,7 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
 
     const results: Record<string, boolean> = {};
     for (const t of unique) {
+      let refreshed = false;
       try {
         const cookie = cf ? `sso-rw=${t};sso=${t};${cf}` : `sso-rw=${t};sso=${t}`;
         const tokenType = tokenTypeByToken.get(t) ?? "sso";
@@ -449,12 +471,24 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
             remaining_queries: remaining,
             ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
           });
-          results[`sso=${t}`] = true;
-        } else {
-          results[`sso=${t}`] = false;
+          await markTokenRecovered(c.env.DB, t);
+          refreshed = true;
         }
+
+        if (syncAge) {
+          try {
+            const ageOk = await verifyImagineAge({ cookie, birthDate, timeoutMs: 15_000 });
+            if (ageOk) {
+              await setTokenAgeVerified(c.env.DB, t, true);
+              refreshed = true;
+            }
+          } catch {
+            // ignore age sync failures during refresh
+          }
+        }
+        results[`sso=${t}`] = refreshed;
       } catch {
-        results[`sso=${t}`] = false;
+        results[`sso=${t}`] = refreshed;
       }
       await new Promise((res) => setTimeout(res, 50));
     }
@@ -845,6 +879,7 @@ adminRoutes.post("/api/tokens/refresh-all", requireAdminAuth, async (c) => {
                 remaining_queries: remaining,
                 ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
               });
+              await markTokenRecovered(c.env.DB, t.token);
             }
             success += 1;
           } else {

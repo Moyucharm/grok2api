@@ -164,14 +164,17 @@ function processTokens(data) {
       tokens.forEach(t => {
         // Normalize
         const tObj = typeof t === 'string'
-          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0 }
+          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0, age_verified: false, age_status: 'unknown', nsfw_status: 'unknown' }
           : {
             token: t.token,
             status: t.status || 'active',
             quota: t.quota || 0,
             note: t.note || '',
             fail_count: t.fail_count || 0,
-            use_count: t.use_count || 0
+            use_count: t.use_count || 0,
+            age_verified: Boolean(t.age_verified),
+            age_status: String(t.age_status || (t.age_verified ? 'verified' : 'unknown')),
+            nsfw_status: String(t.nsfw_status || 'unknown')
           };
         flatTokens.push({ ...tObj, pool: pool, _selected: false });
       });
@@ -273,6 +276,28 @@ function renderTable() {
     tdQuota.className = 'text-center font-mono text-xs';
     tdQuota.innerText = item.quota;
 
+    // Age Verify (Center)
+    const tdAge = document.createElement('td');
+    tdAge.className = 'text-center';
+    if (item.age_status === 'verified' || item.age_verified) {
+      tdAge.innerHTML = '<span class="badge badge-green">已验证</span>';
+    } else {
+      tdAge.innerHTML = '<span class="badge badge-gray" title="尚未做本地状态校准，点击刷新可同步">未校准</span>';
+    }
+
+    // NSFW Switch (Center)
+    const tdNsfw = document.createElement('td');
+    tdNsfw.className = 'text-center';
+    if (item.nsfw_status === 'enabled') {
+      tdNsfw.innerHTML = '<span class="badge badge-green" title="全局请求开关已开启，且该 token 年龄验证已完成">已启用</span>';
+    } else if (item.nsfw_status === 'unknown') {
+      tdNsfw.innerHTML = '<span class="badge badge-gray" title="尚未做本地状态校准，点击刷新可同步">未校准</span>';
+    } else if (item.nsfw_status === 'disabled_by_config') {
+      tdNsfw.innerHTML = '<span class="badge badge-gray" title="当前配置已关闭 imagine NSFW 请求开关">配置关闭</span>';
+    } else {
+      tdNsfw.innerHTML = '<span class="badge badge-gray" title="未知状态">未知</span>';
+    }
+
     // Note (Left)
     const tdNote = document.createElement('td');
     tdNote.className = 'text-left text-gray-500 text-xs truncate max-w-[150px]';
@@ -300,6 +325,8 @@ function renderTable() {
     tr.appendChild(tdType);
     tr.appendChild(tdStatus);
     tr.appendChild(tdQuota);
+    tr.appendChild(tdAge);
+    tr.appendChild(tdNsfw);
     tr.appendChild(tdNote);
     tr.appendChild(tdActions);
 

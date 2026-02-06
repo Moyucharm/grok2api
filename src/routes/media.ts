@@ -241,7 +241,14 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
     const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
     const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
     const baseHeaders = toUpstreamHeaders({ pathname: originalPath, cookie, settings: settingsBundle.grok });
-    upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
+    try {
+      upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await recordTokenFailure(c.env.DB, chosen.token, 502, msg.slice(0, 200));
+      await applyCooldown(c.env.DB, chosen.token, 502);
+      return new Response("Upstream fetch failed", { status: 502 });
+    }
     if (!upstream.ok || !upstream.body) {
       const txt = await upstream.text().catch(() => "");
       await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
@@ -249,7 +256,11 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
       return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
     }
   } else {
-    upstream = await fetch(url.toString(), { headers: toExternalHeaders(rangeHeader) });
+    try {
+      upstream = await fetch(url.toString(), { headers: toExternalHeaders(rangeHeader) });
+    } catch {
+      return new Response("Upstream fetch failed", { status: 502 });
+    }
     if (!upstream.ok || !upstream.body) {
       return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
     }

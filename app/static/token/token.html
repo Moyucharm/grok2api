@@ -10,7 +10,7 @@
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
   <link href="/static/common/common.css" rel="stylesheet">
-  <link href="/static/token/token.css?v=11" rel="stylesheet">
+  <link href="/static/token/token.css?v=12" rel="stylesheet">
   <link href="/static/common/toast.css" rel="stylesheet">
 </head>
 
@@ -27,7 +27,7 @@
       <div class="flex justify-between items-center">
         <div>
           <h2 class="text-2xl font-semibold tracking-tight">Token 列表</h2>
-          <p class="text-[var(--accents-4)] mt-1 text-sm">管理 Grok2API 的 Token 服务号池。</p>
+          <p class="text-[var(--accents-4)] mt-1 text-sm">管理 Grok2API 的 Token 服务号池。年龄/NSFW 为本地校准状态，点击“刷新”可同步。</p>
         </div>
         <div class="flex items-center gap-3">
           <button onclick="openImportModal()" class="geist-button-outline gap-2">
@@ -91,7 +91,7 @@
 
       <!-- Token Table -->
       <div class="rounded-lg overflow-hidden bg-white mb-4 overflow-x-auto">
-        <table class="geist-table min-w-[800px]">
+        <table class="geist-table min-w-[980px]">
           <thead>
             <tr>
               <th class="w-10"><input type="checkbox" id="select-all" class="checkbox" onclick="toggleSelectAll()"></th>
@@ -99,6 +99,8 @@
               <th class="w-24">类型</th>
               <th class="w-24">状态</th>
               <th class="w-20">额度</th>
+              <th class="w-24">年龄验证</th>
+              <th class="w-28">NSFW 开关</th>
               <th class="text-left">备注</th>
               <th class="w-32 text-center">操作</th>
             </tr>
@@ -320,7 +322,7 @@
   <script src="/static/common/header.js?v=1"></script>
   <script src="/static/common/footer.js?v=1"></script>
   <script src="/static/common/toast.js"></script>
-  <script src="/static/token/token.js?v=14"></script>
+  <script src="/static/token/token.js?v=15"></script>
 </body>
 
 </html>

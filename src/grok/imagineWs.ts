@@ -130,7 +130,21 @@ export async function verifyImagineAge(args: ImagineAgeVerifyArgs): Promise<bool
       body: JSON.stringify({ birthDate: args.birthDate }),
       signal: controller.signal,
     });
-    return resp.ok;
+    if (resp.ok) return true;
+
+    const txt = await resp.text().catch(() => "");
+    const low = txt.toLowerCase();
+    if ([400, 409, 422].includes(resp.status)) {
+      if (
+        low.includes("already") ||
+        low.includes("birth date") ||
+        low.includes("cannot be changed") ||
+        low.includes("already set")
+      ) {
+        return true;
+      }
+    }
+    return false;
   } catch {
     return false;
   } finally {

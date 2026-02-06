@@ -21,6 +21,18 @@ export interface TokenRow {
 }
 
 const MAX_FAILURES = 3;
+let ensuredAgeVerifiedColumn = false;
+
+async function ensureAgeVerifiedColumn(db: Env["DB"]): Promise<void> {
+  if (ensuredAgeVerifiedColumn) return;
+  try {
+    await dbRun(db, "ALTER TABLE tokens ADD COLUMN age_verified INTEGER NOT NULL DEFAULT 0");
+  } catch {
+    // ignore duplicate-column / unsupported-alter errors
+  } finally {
+    ensuredAgeVerifiedColumn = true;
+  }
+}
 
 function parseTags(tagsJson: string): string[] {
   try {
@@ -98,10 +110,18 @@ export async function listTokens(db: Env["DB"]): Promise<TokenRow[]> {
     );
   } catch {
     // Backward compatibility: old schema may not have `age_verified` yet.
-    return dbAll<TokenRow>(
-      db,
-      "SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, 0 as age_verified, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ORDER BY created_time DESC",
-    );
+    await ensureAgeVerifiedColumn(db);
+    try {
+      return await dbAll<TokenRow>(
+        db,
+        "SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, age_verified, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ORDER BY created_time DESC",
+      );
+    } catch {
+      return dbAll<TokenRow>(
+        db,
+        "SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, 0 as age_verified, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ORDER BY created_time DESC",
+      );
+    }
   }
 }
 
@@ -238,6 +258,14 @@ export async function updateTokenLimits(
   await dbRun(db, `UPDATE tokens SET ${parts.join(", ")} WHERE token = ?`, params);
 }
 
+export async function markTokenRecovered(db: Env["DB"], token: string): Promise<void> {
+  await dbRun(
+    db,
+    "UPDATE tokens SET status = 'active', failed_count = 0, cooldown_until = NULL, last_failure_time = NULL, last_failure_reason = NULL WHERE token = ?",
+    [token],
+  );
+}
+
 export async function getTokenAgeVerified(db: Env["DB"], token: string): Promise<boolean> {
   try {
     const row = await dbFirst<{ age_verified: number }>(
@@ -247,7 +275,17 @@ export async function getTokenAgeVerified(db: Env["DB"], token: string): Promise
     );
     return Number(row?.age_verified ?? 0) > 0;
   } catch {
-    return false;
+    await ensureAgeVerifiedColumn(db);
+    try {
+      const row = await dbFirst<{ age_verified: number }>(
+        db,
+        "SELECT age_verified FROM tokens WHERE token = ?",
+        [token],
+      );
+      return Number(row?.age_verified ?? 0) > 0;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -259,6 +297,11 @@ export async function setTokenAgeVerified(
   try {
     await dbRun(db, "UPDATE tokens SET age_verified = ? WHERE token = ?", [verified ? 1 : 0, token]);
   } catch {
-    // ignore on schema mismatch
+    await ensureAgeVerifiedColumn(db);
+    try {
+      await dbRun(db, "UPDATE tokens SET age_verified = ? WHERE token = ?", [verified ? 1 : 0, token]);
+    } catch {
+      // ignore on schema mismatch
+    }
   }
 }
