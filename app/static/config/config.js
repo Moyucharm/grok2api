@@ -3,6 +3,8 @@ let currentConfig = {};
 const NUMERIC_FIELDS = new Set([
   'timeout',
   'max_retry',
+  'imagine_max_retries',
+  'imagine_blocked_retry_limit',
   'refresh_interval_hours',
   'fail_threshold',
   'limit_mb',
@@ -40,6 +42,11 @@ const LOCALE_MAP = {
     "base_proxy_url": { title: "基础代理 URL", desc: "代理请求到 Grok 官网的基础服务地址。" },
     "asset_proxy_url": { title: "资源代理 URL", desc: "代理请求到 Grok 官网的静态资源（图片/视频）地址。" },
     "cf_clearance": { title: "CF Clearance", desc: "Cloudflare 验证 Cookie，用于验证 Cloudflare 的验证。" },
+    "imagine_auto_age_verify": { title: "Imagine 自动年龄验证", desc: "首次使用某个 Token 生成 imagine 图片时自动调用年龄验证接口。" },
+    "imagine_enable_nsfw": { title: "Imagine 启用 NSFW", desc: "是否在 imagine 生成请求中启用 NSFW（默认开启）。" },
+    "imagine_birth_date": { title: "Imagine 生日参数", desc: "自动年龄验证调用 set-birth-date 时使用的 birthDate 值（ISO 格式）。" },
+    "imagine_max_retries": { title: "Imagine 最大重试", desc: "grok-imagine 新链路在失败时的最大重试次数。" },
+    "imagine_blocked_retry_limit": { title: "Imagine Blocked 重试上限", desc: "检测到 blocked（只有中间图无最终图）时允许的重试次数。" },
     "max_retry": { title: "最大重试", desc: "请求 Grok 服务失败时的最大重试次数。" },
     "retry_status_codes": { title: "重试状态码", desc: "触发重试的 HTTP 状态码列表。" }
   },

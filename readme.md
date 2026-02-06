@@ -187,7 +187,7 @@ curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
-    "model": "grok-imagine-1.0",
+    "model": "grok-imagine",
     "prompt": "一只在太空漂浮的猫",
     "n": 1
   }'
@@ -200,7 +200,7 @@ curl http://localhost:8000/v1/images/generations \
 
 | 字段       | 类型    | 说明             | 可用参数                                     |
 | :--------- | :------ | :--------------- | :------------------------------------------- |
-| `model`  | string  | 图像模型名       | `grok-imagine-1.0`                         |
+| `model`  | string  | 图像模型名       | `grok-imagine`, `grok-imagine-1.0`         |
 | `prompt` | string  | 图像描述提示词   | -                                            |
 | `n`      | integer | 生成数量         | `1` - `10` (流式模式仅限 `1` 或 `2`) |
 | `stream` | boolean | 是否开启流式输出 | `true`, `false`                          |
@@ -263,6 +263,22 @@ curl http://localhost:8000/v1/images/generations \
 |                       | `admin_assets_batch_size`  | 管理端批量   | 管理端在线资产统计/清理批量并发数量。推荐 10。       | `10`                                                    |
 
 <br>
+
+## Worker Imagine Update
+
+- `grok-imagine` now uses the built-in Worker imagine pipeline (direct Grok WebSocket).
+- `grok-imagine-1.0` and `grok-imagine-1.0-video` remain legacy models for backward compatibility.
+- New settings: `grok.imagine_auto_age_verify`, `grok.imagine_enable_nsfw`, `grok.imagine_birth_date`, `grok.imagine_max_retries`, `grok.imagine_blocked_retry_limit`.
+- `/v1/images/generations` supports:
+  - `response_format`: `url` or `b64_json`
+  - `size`: OpenAI size mapped to aspect ratio
+  - `image_config.aspect_ratio`: higher priority than `size`
+  - `image_config.resolution`: accepted but downgraded (warning in `x-grok2api-warning`)
+- `/v1/chat/completions` with `model=grok-imagine` now uses the built-in imagine pipeline.
+- For `stream=true`, SSE sends progress text first and then final Markdown image links.
+- Image generation now triggers async cache prefetch into KV (non-blocking).
+- Cache gallery opens `/images/*` directly, avoiding `/v1/*` auth interception.
+- Legacy `/v1/files/image/*` and `/v1/files/video/*` remain available and redirect to `/images/*`.
 
 ## Star History
 

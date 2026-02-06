@@ -10,6 +10,7 @@ export interface TokenRow {
   created_time: number;
   remaining_queries: number;
   heavy_remaining_queries: number;
+  age_verified: number;
   status: string;
   tags: string; // JSON string
   note: string;
@@ -90,10 +91,18 @@ export function tokenRowToInfo(row: TokenRow): {
 }
 
 export async function listTokens(db: Env["DB"]): Promise<TokenRow[]> {
-  return dbAll<TokenRow>(
-    db,
-    "SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ORDER BY created_time DESC",
-  );
+  try {
+    return await dbAll<TokenRow>(
+      db,
+      "SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, age_verified, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ORDER BY created_time DESC",
+    );
+  } catch {
+    // Backward compatibility: old schema may not have `age_verified` yet.
+    return dbAll<TokenRow>(
+      db,
+      "SELECT token, token_type, created_time, remaining_queries, heavy_remaining_queries, 0 as age_verified, status, tags, note, cooldown_until, last_failure_time, last_failure_reason, failed_count FROM tokens ORDER BY created_time DESC",
+    );
+  }
 }
 
 export async function addTokens(db: Env["DB"], tokens: string[], token_type: TokenType): Promise<number> {
@@ -227,4 +236,29 @@ export async function updateTokenLimits(
   if (!parts.length) return;
   params.push(token);
   await dbRun(db, `UPDATE tokens SET ${parts.join(", ")} WHERE token = ?`, params);
+}
+
+export async function getTokenAgeVerified(db: Env["DB"], token: string): Promise<boolean> {
+  try {
+    const row = await dbFirst<{ age_verified: number }>(
+      db,
+      "SELECT age_verified FROM tokens WHERE token = ?",
+      [token],
+    );
+    return Number(row?.age_verified ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function setTokenAgeVerified(
+  db: Env["DB"],
+  token: string,
+  verified: boolean,
+): Promise<void> {
+  try {
+    await dbRun(db, "UPDATE tokens SET age_verified = ? WHERE token = ?", [verified ? 1 : 0, token]);
+  } catch {
+    // ignore on schema mismatch
+  }
 }

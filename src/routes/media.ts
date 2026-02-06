@@ -41,9 +41,19 @@ function base64UrlDecode(input: string): string {
   return new TextDecoder().decode(bytes);
 }
 
-function isAllowedUpstreamHost(hostname: string): boolean {
+function isGrokUpstreamHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
   return h === "assets.grok.com" || h === "grok.com" || h.endsWith(".grok.com");
+}
+
+function dynamicAllowedHosts(): Set<string> {
+  return new Set<string>(["assets.grok.com", "grok.com", "imagine-public.x.ai"]);
+}
+
+function isAllowedUpstreamHost(hostname: string, allowedHosts: Set<string>): boolean {
+  const h = hostname.toLowerCase();
+  if (isGrokUpstreamHost(h)) return true;
+  return allowedHosts.has(h);
 }
 
 function isUuid(s: string): boolean {
@@ -141,11 +151,24 @@ function toUpstreamHeaders(args: { pathname: string; cookie: string; settings: A
   return headers;
 }
 
+function toExternalHeaders(rangeHeader: string | undefined): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: "*/*",
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+  };
+  if (rangeHeader) headers.Range = rangeHeader;
+  return headers;
+}
+
 mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   const imgPath = c.req.param("imgPath");
+  const settingsBundle = await getSettings(c.env);
+  const allowedHosts = dynamicAllowedHosts();
 
   let upstreamPath: string | null = null;
   let upstreamUrl: URL | null = null;
+  let rejectedUpstreamHost = false;
 
   // New encoding: p_<base64url(pathname)>
   if (imgPath.startsWith("p_")) {
@@ -161,11 +184,14 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
     try {
       const decodedUrl = base64UrlDecode(imgPath.slice(2));
       const u = new URL(decodedUrl);
-      if (isAllowedUpstreamHost(u.hostname)) upstreamUrl = u;
+      if (isAllowedUpstreamHost(u.hostname, allowedHosts)) upstreamUrl = u;
+      else rejectedUpstreamHost = true;
     } catch {
       upstreamUrl = null;
     }
   }
+
+  if (rejectedUpstreamHost && !upstreamUrl) return c.text("Upstream host not allowed", 403);
 
   if (upstreamUrl) upstreamPath = upstreamUrl.pathname;
 
@@ -206,23 +232,27 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   // stale metadata cleanup (best-effort)
   c.executionCtx.waitUntil(deleteCacheRow(c.env.DB, key));
 
-  const settingsBundle = await getSettings(c.env);
-  const chosen = await selectBestToken(c.env.DB, "grok-4-fast");
-  if (!chosen) return c.text("No available token", 503);
+  const needsGrokAuth = isGrokUpstreamHost(url.hostname);
+  let upstream: Response;
+  if (needsGrokAuth) {
+    const chosen = await selectBestToken(c.env.DB, "grok-4-fast");
+    if (!chosen) return c.text("No available token", 503);
 
-  const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
-  const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
-
-  const baseHeaders = toUpstreamHeaders({ pathname: originalPath, cookie, settings: settingsBundle.grok });
-
-  // Range requests: KV can't stream partial content efficiently; proxy from upstream.
-  // (If the object is cached and within KV limits, we do support Range by slicing bytes above.)
-  const upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
-  if (!upstream.ok || !upstream.body) {
-    const txt = await upstream.text().catch(() => "");
-    await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
-    await applyCooldown(c.env.DB, chosen.token, upstream.status);
-    return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
+    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+    const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
+    const baseHeaders = toUpstreamHeaders({ pathname: originalPath, cookie, settings: settingsBundle.grok });
+    upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
+    if (!upstream.ok || !upstream.body) {
+      const txt = await upstream.text().catch(() => "");
+      await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
+      await applyCooldown(c.env.DB, chosen.token, upstream.status);
+      return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
+    }
+  } else {
+    upstream = await fetch(url.toString(), { headers: toExternalHeaders(rangeHeader) });
+    if (!upstream.ok || !upstream.body) {
+      return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
+    }
   }
 
   const contentType = upstream.headers.get("content-type") ?? "";

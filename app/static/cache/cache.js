@@ -847,7 +847,7 @@ function renderLocalCacheList(type, items) {
 
 function viewLocalFile(type, name) {
   const safeName = encodeURIComponent(name);
-  const url = type === 'image' ? `/v1/files/image/${safeName}` : `/v1/files/video/${safeName}`;
+  const url = `/images/${safeName}`;
   window.open(url, '_blank');
 }
 

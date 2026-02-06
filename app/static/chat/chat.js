@@ -256,7 +256,10 @@ async function refreshModels() {
       sel.appendChild(opt);
     });
 
-    if (currentTab === 'image') sel.value = 'grok-imagine-1.0';
+    if (currentTab === 'image') {
+      if (filtered.some((m) => String(m.id || '') === 'grok-imagine')) sel.value = 'grok-imagine';
+      else if (filtered.some((m) => String(m.id || '') === 'grok-imagine-1.0')) sel.value = 'grok-imagine-1.0';
+    }
     else if (currentTab === 'video') sel.value = 'grok-imagine-1.0-video';
     else sel.value = sel.value || 'grok-4-fast';
   } catch (e) {
@@ -406,7 +409,7 @@ async function streamChat(body, bubbleEl) {
 async function generateImage() {
   const prompt = String(q('image-prompt').value || '').trim();
   if (!prompt) return showToast('请输入 prompt', 'warning');
-  const model = String(q('model-select').value || 'grok-imagine-1.0').trim();
+  const model = String(q('model-select').value || 'grok-imagine').trim();
   const n = Math.max(1, Math.min(10, Math.floor(Number(q('image-n').value || 1) || 1)));
 
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };

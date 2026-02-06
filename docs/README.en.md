@@ -111,8 +111,12 @@ Required config keys (Admin -> Config, `register.*`):
 | `grok-4-heavy` | 4 | Super | Yes | Yes | - |
 | `grok-4.1` | 1 | Basic/Super | Yes | Yes | - |
 | `grok-4.1-thinking` | 4 | Basic/Super | Yes | Yes | - |
+| `grok-imagine` | 4 | Basic/Super | Yes (image-chat) | Yes | - |
 | `grok-imagine-1.0` | 4 | Basic/Super | - | Yes | - |
 | `grok-imagine-1.0-video` | - | Basic/Super | - | - | Yes |
+
+`grok-imagine` uses the built-in Worker imagine pipeline (direct Grok WebSocket). `grok-imagine-1.0` / `grok-imagine-1.0-video` remain legacy models.
+You can configure imagine behavior in settings: `imagine_auto_age_verify`, `imagine_enable_nsfw`, `imagine_birth_date`, `imagine_max_retries`, `imagine_blocked_retry_limit`.
 
 <br>
 
@@ -141,12 +145,18 @@ curl http://localhost:8000/v1/chat/completions \
 | `model` | string | Model ID | - |
 | `messages` | array | Message list | `developer`, `system`, `user`, `assistant` |
 | `stream` | boolean | Enable streaming | `true`, `false` |
+| `n` | integer | Image count for `grok-imagine` | `1` - `10` |
+| `size` | string | OpenAI-style image size (for `grok-imagine`) | e.g. `1024x1536`, `1536x1024` |
+| `image_config` | object | `grok-imagine` image options | `aspect_ratio`, `resolution` |
 | `thinking` | string | Thinking mode | `enabled`, `disabled`, `null` |
 | `video_config` | object | **Video model only** | - |
 | └─ `aspect_ratio` | string | Video aspect ratio | `16:9`, `9:16`, `1:1`, `2:3`, `3:2` |
 | └─ `video_length` | integer | Video length (seconds) | `5` - `15` |
 | └─ `resolution` | string | Resolution | `SD`, `HD` |
 | └─ `preset` | string | Style preset | `fun`, `normal`, `spicy` |
+
+When `model=grok-imagine`, `/v1/chat/completions` uses the built-in imagine pipeline.
+With `stream=false`, response content is Markdown image links. With `stream=true`, SSE emits progress text first, then final image Markdown.
 
 Note: any other parameters will be discarded and ignored.
 
@@ -162,7 +172,7 @@ curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GROK2API_API_KEY" \
   -d '{
-    "model": "grok-imagine-1.0",
+    "model": "grok-imagine",
     "prompt": "A cat floating in space",
     "n": 1
   }'
@@ -175,12 +185,16 @@ curl http://localhost:8000/v1/images/generations \
 
 | Field | Type | Description | Allowed values |
 | :--- | :--- | :--- | :--- |
-| `model` | string | Image model ID | `grok-imagine-1.0` |
+| `model` | string | Image model ID | `grok-imagine`, `grok-imagine-1.0` |
 | `prompt` | string | Prompt | - |
-| `n` | integer | Number of images | `1` - `10` (streaming: `1` or `2` only) |
+| `n` | integer | Number of images | `1` - `10` |
+| `size` | string | OpenAI size mapped to aspect ratio | `1024x1024`, `1024x1536`, `1536x1024`, `1024x1792`, `1792x1024` |
+| `response_format` | string | Output format | `url`, `b64_json` |
+| `image_config.aspect_ratio` | string | Aspect ratio override (higher priority than `size`) | `1:1`, `2:3`, `3:2`, `9:16`, `16:9` |
+| `image_config.resolution` | string | Accepted but downgraded | any string; currently not enforced, warning is returned in `x-grok2api-warning` |
 | `stream` | boolean | Enable streaming | `true`, `false` |
 
-Note: any other parameters will be discarded and ignored.
+Generated images are auto-prefetched into KV cache asynchronously after response (non-blocking).
 
 <br>
 

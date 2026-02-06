@@ -5,11 +5,23 @@ import { requireApiAuth } from "../auth";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { isValidModel, MODEL_CONFIG } from "../grok/models";
 import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
+import {
+  generateImagineViaWs,
+  ImagineWsError,
+  type ImagineProgressEvent,
+  verifyImagineAge,
+} from "../grok/imagineWs";
 import { uploadImage } from "../grok/upload";
 import { createMediaPost, createPost } from "../grok/create";
 import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import {
+  applyCooldown,
+  getTokenAgeVerified,
+  recordTokenFailure,
+  selectBestToken,
+  setTokenAgeVerified,
+} from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
 import { getApiKeyLimits } from "../repo/apiKeys";
 import { localDayString, tryConsumeDailyUsage, tryConsumeDailyUsageMulti } from "../repo/apiKeyUsage";
@@ -34,12 +46,12 @@ async function mapLimit<T, R>(
   limit: number,
   fn: (item: T) => Promise<R>,
 ): Promise<R[]> {
-  const results: R[] = [];
-  const queue = items.slice();
+  const results = new Array<R>(items.length);
+  const queue = items.map((item, index) => ({ item, index }));
   const workers = Array.from({ length: Math.max(1, limit) }, async () => {
     while (queue.length) {
-      const item = queue.shift() as T;
-      results.push(await fn(item));
+      const job = queue.shift() as { item: T; index: number };
+      results[job.index] = await fn(job.item);
     }
   });
   await Promise.all(workers);
@@ -68,6 +80,247 @@ function parseIntSafe(v: string | undefined, fallback: number): number {
 
 function quotaError(bucket: string): Record<string, unknown> {
   return openAiError(`Daily quota exceeded: ${bucket}`, "daily_quota_exceeded");
+}
+
+const VALID_IMAGE_ASPECT_RATIOS = new Set(["1:1", "2:3", "3:2", "9:16", "16:9"]);
+const ASPECT_RATIO_TO_SIZE: Record<"1:1" | "2:3" | "3:2" | "9:16" | "16:9", string> = {
+  "1:1": "1024x1024",
+  "2:3": "1024x1536",
+  "3:2": "1536x1024",
+  "9:16": "1024x1792",
+  "16:9": "1792x1024",
+};
+
+type ImageResponseFormat = "url" | "b64_json";
+
+function normalizeImageResponseFormat(v: unknown): ImageResponseFormat | null {
+  const format = String(v ?? "url").trim().toLowerCase();
+  if (format === "url") return "url";
+  if (format === "b64_json") return "b64_json";
+  return null;
+}
+
+function mapSizeToAspectRatio(sizeRaw: unknown): string | null {
+  const size = String(sizeRaw ?? "").trim().toLowerCase();
+  if (!size) return null;
+  const map: Record<string, string> = {
+    "1024x1024": "1:1",
+    "512x512": "1:1",
+    "256x256": "1:1",
+    "1024x1536": "2:3",
+    "1536x1024": "3:2",
+    "1024x1792": "9:16",
+    "1792x1024": "16:9",
+  };
+  return map[size] ?? null;
+}
+
+function resolveImagineAspectRatio(args: {
+  size?: unknown;
+  imageConfig: { aspect_ratio?: unknown } | undefined;
+}): "1:1" | "2:3" | "3:2" | "9:16" | "16:9" {
+  const byImageConfig = String(args.imageConfig?.aspect_ratio ?? "").trim();
+  if (byImageConfig) {
+    if (!VALID_IMAGE_ASPECT_RATIOS.has(byImageConfig))
+      throw new Error(`Invalid image_config.aspect_ratio '${byImageConfig}'`);
+    return byImageConfig as "1:1" | "2:3" | "3:2" | "9:16" | "16:9";
+  }
+
+  const bySize = mapSizeToAspectRatio(args.size);
+  if (bySize && VALID_IMAGE_ASPECT_RATIOS.has(bySize)) {
+    return bySize as "1:1" | "2:3" | "3:2" | "9:16" | "16:9";
+  }
+
+  return "2:3";
+}
+
+function resolveImagineSize(args: {
+  size?: unknown;
+  imageConfig: { aspect_ratio?: unknown } | undefined;
+}): string {
+  const ratio = resolveImagineAspectRatio(args);
+  return ASPECT_RATIO_TO_SIZE[ratio];
+}
+
+function hasResolutionDowngradeWarning(imageConfig: { resolution?: unknown } | undefined): string | null {
+  const resolution = String(imageConfig?.resolution ?? "").trim();
+  if (!resolution) return null;
+  return `image_config.resolution='${resolution}' accepted but not enforced; using size/aspect_ratio only`;
+}
+
+function withOptionalWarningHeader(res: Response, warning: string | null): Response {
+  if (!warning) return res;
+  const headers = new Headers(res.headers);
+  headers.set("x-grok2api-warning", warning);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let out = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    out += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(out);
+}
+
+async function fetchProxyImageAsBase64(origin: string, encodedPath: string): Promise<string> {
+  const url = `${origin}/images/${encodedPath}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Fetch image failed: ${resp.status}`);
+  const bytes = await resp.arrayBuffer();
+  return arrayBufferToBase64(bytes);
+}
+
+function scheduleImagePrefetch(c: any, origin: string, encodedPaths: string[]): void {
+  const targets = [...new Set(encodedPaths.filter(Boolean))];
+  if (!targets.length) return;
+  c.executionCtx.waitUntil(
+    mapLimit(targets, 3, async (path) => {
+      try {
+        const r = await fetch(`${origin}/images/${path}`);
+        if (!r.ok) return;
+        await r.arrayBuffer();
+      } catch {
+        // ignore
+      }
+    }),
+  );
+}
+
+function markdownFromRawImageUrls(args: { baseUrl: string; rawUrls: string[] }): string {
+  const lines: string[] = [];
+  for (const raw of args.rawUrls) {
+    const path = encodeAssetPath(raw);
+    lines.push(`![Generated Image](${toProxyUrl(args.baseUrl, path)})`);
+  }
+  return lines.join("\n");
+}
+
+function imagineErrorStatus(err: unknown): number {
+  if (err instanceof ImagineWsError) {
+    const status = err.status;
+    if (typeof status === "number" && Number.isFinite(status)) return status;
+  }
+  return 500;
+}
+
+function imagineErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
+}
+
+function streamChunk(args: {
+  id: string;
+  created: number;
+  model: string;
+  content?: string;
+  finishReason?: "stop" | null;
+  includeRole?: boolean;
+}): string {
+  const delta: Record<string, unknown> = {};
+  if (args.includeRole) delta.role = "assistant";
+  if (typeof args.content === "string" && args.content) delta.content = args.content;
+
+  return `data: ${JSON.stringify({
+    id: args.id,
+    object: "chat.completion.chunk",
+    created: args.created,
+    model: args.model,
+    choices: [{ index: 0, delta, finish_reason: args.finishReason ?? null }],
+  })}\n\n`;
+}
+
+type SettingsBundle = Awaited<ReturnType<typeof getSettings>>;
+
+function buildGrokCookie(jwt: string, cfCookie: string): string {
+  return cfCookie ? `sso-rw=${jwt};sso=${jwt};${cfCookie}` : `sso-rw=${jwt};sso=${jwt}`;
+}
+
+function ensureBirthDate(input: string): string {
+  const v = input.trim();
+  return v || "2001-01-01T16:00:00.000Z";
+}
+
+async function generateImagineWsWithRetries(args: {
+  env: Env;
+  settings: SettingsBundle;
+  requestedModel: string;
+  prompt: string;
+  aspectRatio: "1:1" | "2:3" | "3:2" | "9:16" | "16:9";
+  n: number;
+  onProgress?: (event: ImagineProgressEvent) => Promise<void> | void;
+}): Promise<{ urls: string[]; b64List: string[]; tokenSuffix: string }> {
+  const retryCodes = Array.isArray(args.settings.grok.retry_status_codes)
+    ? args.settings.grok.retry_status_codes
+    : [401, 429, 403];
+  const maxRetries = Math.max(1, Math.floor(Number(args.settings.grok.imagine_max_retries ?? 5)));
+  const blockedRetryLimit = Math.max(0, Math.floor(Number(args.settings.grok.imagine_blocked_retry_limit ?? 3)));
+  const autoAgeVerify = args.settings.grok.imagine_auto_age_verify !== false;
+  const enableNsfw = args.settings.grok.imagine_enable_nsfw !== false;
+  const birthDate = ensureBirthDate(String(args.settings.grok.imagine_birth_date ?? ""));
+  const cf = normalizeCfCookie(args.settings.grok.cf_clearance ?? "");
+
+  let blockedRetries = 0;
+  let lastError: unknown = null;
+  let lastStatus = 500;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const chosen = await selectBestToken(args.env.DB, args.requestedModel);
+    if (!chosen) throw new Error("No available token");
+
+    const jwt = chosen.token;
+    const cookie = buildGrokCookie(jwt, cf);
+
+    if (autoAgeVerify) {
+      const verified = await getTokenAgeVerified(args.env.DB, jwt);
+      if (!verified) {
+        const ok = await verifyImagineAge({ cookie, birthDate });
+        if (ok) await setTokenAgeVerified(args.env.DB, jwt, true);
+      }
+    }
+
+    try {
+      const generated = await generateImagineViaWs({
+        prompt: args.prompt,
+        aspectRatio: args.aspectRatio,
+        n: args.n,
+        cookie,
+        enableNsfw,
+        ...(args.onProgress ? { onProgress: args.onProgress } : {}),
+      });
+      return { urls: generated.urls, b64List: generated.b64List, tokenSuffix: jwt.slice(-6) };
+    } catch (err) {
+      lastError = err;
+      const msg = imagineErrorMessage(err);
+      const status = imagineErrorStatus(err);
+      lastStatus = status;
+
+      await recordTokenFailure(args.env.DB, jwt, status, msg.slice(0, 200));
+      await applyCooldown(args.env.DB, jwt, status);
+
+      const code = err instanceof ImagineWsError ? err.code : "";
+      if (code === "blocked") {
+        blockedRetries += 1;
+        if (blockedRetries >= blockedRetryLimit) break;
+      }
+
+      const retryable =
+        code === "blocked" ||
+        (err instanceof ImagineWsError && err.retryable) ||
+        retryCodes.includes(status);
+      if (retryable && attempt < maxRetries - 1) continue;
+      break;
+    }
+  }
+
+  if (lastError instanceof Error) throw lastError;
+  throw new ImagineWsError("Image generation failed", {
+    code: "imagine_ws_failed",
+    status: lastStatus,
+    retryable: false,
+  });
 }
 
 async function enforceQuota(args: {
@@ -240,6 +493,12 @@ openAiRoutes.post("/chat/completions", async (c) => {
       model?: string;
       messages?: any[];
       stream?: boolean;
+      n?: number;
+      size?: string;
+      image_config?: {
+        aspect_ratio?: string;
+        resolution?: string;
+      };
       video_config?: {
         aspect_ratio?: string;
         video_length?: number;
@@ -264,10 +523,16 @@ openAiRoutes.post("/chat/completions", async (c) => {
     const stream = Boolean(body.stream);
     const maxRetry = 3;
     let lastErr: string | null = null;
+    const imageNRaw = Number(body.n ?? 1);
+    const imagineImageCount = Number.isFinite(imageNRaw)
+      ? Math.max(1, Math.min(10, Math.floor(imageNRaw)))
+      : 1;
 
     // === Quota check (best-effort) ===
     // - heavy: consumes both heavy + chat
-    // - image model: counts as 2 images per request (grok upstream emits up to 2)
+    // - image model:
+    //   - ws_imagine: counts as requested n
+    //   - legacy imagine: counts as 2 images per request (grok upstream emits up to 2)
     // - video model: 1 video per request
     // - others: 1 chat per request
     const quotaKind = cfg.is_video_model ? "video" : cfg.is_image_model ? "image" : "chat";
@@ -276,9 +541,180 @@ openAiRoutes.post("/chat/completions", async (c) => {
       apiAuth: c.get("apiAuth"),
       model: requestedModel,
       kind: quotaKind as any,
-      ...(cfg.is_image_model ? { imageCount: 2 } : {}),
+      ...(cfg.is_image_model
+        ? { imageCount: cfg.transport === "ws_imagine" ? imagineImageCount : 2 }
+        : {}),
     });
     if (!quota.ok) return quota.resp;
+
+    if (cfg.transport === "ws_imagine") {
+      const { content } = extractContent(body.messages as any);
+      const prompt = String(content ?? "").trim();
+      if (!prompt) return c.json(openAiError("Missing image prompt in 'messages'", "missing_prompt"), 400);
+
+      let aspectRatio: "1:1" | "2:3" | "3:2" | "9:16" | "16:9";
+      try {
+        aspectRatio = resolveImagineAspectRatio({ size: body.size, imageConfig: body.image_config });
+      } catch (e) {
+        return c.json(openAiError(e instanceof Error ? e.message : "Invalid image_config.aspect_ratio", "invalid_aspect_ratio"), 400);
+      }
+
+      const warning = hasResolutionDowngradeWarning(body.image_config);
+      const baseUrl = (settingsBundle.global.base_url ?? "").trim() || origin;
+
+      if (stream) {
+        const sse = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const encoder = new TextEncoder();
+            const chunkId = `chatcmpl-${crypto.randomUUID()}`;
+            const created = Math.floor(Date.now() / 1000);
+            let sentRole = false;
+            const stageName: Record<string, string> = {
+              preview: "preview",
+              medium: "medium",
+              final: "final",
+            };
+            const emitted = new Set<string>();
+
+            const push = (contentText: string, finishReason: "stop" | null = null) => {
+              controller.enqueue(
+                encoder.encode(
+                  streamChunk({
+                    id: chunkId,
+                    created,
+                    model: requestedModel,
+                    content: contentText,
+                    finishReason,
+                    includeRole: !sentRole,
+                  }),
+                ),
+              );
+              sentRole = true;
+            };
+
+            const done = () => controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+
+            try {
+              push("Generating image(s)...\n");
+              const generated = await generateImagineWsWithRetries({
+                env: c.env,
+                settings: settingsBundle,
+                requestedModel,
+                prompt,
+                aspectRatio,
+                n: imagineImageCount,
+                onProgress: async (event) => {
+                  const key = `${event.image_id}:${event.stage}`;
+                  if (emitted.has(key)) return;
+                  emitted.add(key);
+                  const stage = stageName[event.stage] ?? event.stage;
+                  push(`Image ${event.completed}/${event.total}: ${stage}\n`);
+                },
+              });
+
+              if (!generated.urls.length) throw new Error("No image URL returned from imagine WS");
+              const encoded = generated.urls.map((u) => encodeAssetPath(u));
+              scheduleImagePrefetch(c, origin, encoded);
+              push(markdownFromRawImageUrls({ baseUrl, rawUrls: generated.urls }), "stop");
+              done();
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(((Date.now() - start) / 1000).toFixed(2)),
+                status: 200,
+                key_name: keyName,
+                token_suffix: generated.tokenSuffix,
+                error: "",
+              });
+              controller.close();
+              return;
+            } catch (e) {
+              const msg = imagineErrorMessage(e);
+              const status = imagineErrorStatus(e);
+              push(`Error: ${msg}`, "stop");
+              done();
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(((Date.now() - start) / 1000).toFixed(2)),
+                status,
+                key_name: keyName,
+                token_suffix: "",
+                error: msg,
+              });
+              controller.close();
+            }
+          },
+        });
+
+        const headers = new Headers({
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          "Access-Control-Allow-Origin": "*",
+        });
+        if (warning) headers.set("x-grok2api-warning", warning);
+        return new Response(sse, { status: 200, headers });
+      }
+
+      try {
+        const generated = await generateImagineWsWithRetries({
+          env: c.env,
+          settings: settingsBundle,
+          requestedModel,
+          prompt,
+          aspectRatio,
+          n: imagineImageCount,
+        });
+
+        if (!generated.urls.length) throw new Error("No image URL returned from imagine WS");
+        const encoded = generated.urls.map((u) => encodeAssetPath(u));
+        scheduleImagePrefetch(c, origin, encoded);
+        const contentMd = markdownFromRawImageUrls({ baseUrl, rawUrls: generated.urls });
+
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status: 200,
+          key_name: keyName,
+          token_suffix: generated.tokenSuffix,
+          error: "",
+        });
+
+        const res = c.json({
+          id: `chatcmpl-${crypto.randomUUID()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: requestedModel,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: contentMd },
+              finish_reason: "stop",
+            },
+          ],
+          usage: null,
+        });
+        return withOptionalWarningHeader(res, warning);
+      } catch (e) {
+        lastErr = imagineErrorMessage(e);
+        const status = imagineErrorStatus(e);
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status,
+          key_name: keyName,
+          token_suffix: "",
+          error: lastErr,
+        });
+        return c.json(openAiError(lastErr, "upstream_error"), (status || 500) as any);
+      }
+    }
 
     for (let attempt = 0; attempt < maxRetry; attempt++) {
       const chosen = await selectBestToken(c.env.DB, requestedModel);
@@ -431,13 +867,27 @@ openAiRoutes.post("/images/generations", async (c) => {
   const keyName = c.get("apiAuth").name ?? "Unknown";
   const origin = new URL(c.req.url).origin;
 
-  let requestedModel = "grok-imagine-1.0";
+  let requestedModel = "grok-imagine";
   try {
-    const body = (await c.req.json()) as { prompt?: string; model?: string; n?: number };
+    const body = (await c.req.json()) as {
+      prompt?: string;
+      model?: string;
+      n?: number;
+      size?: string;
+      response_format?: string;
+      image_config?: {
+        aspect_ratio?: string;
+        resolution?: string;
+      };
+    };
     const prompt = String(body.prompt ?? "").trim();
     if (!prompt) return c.json(openAiError("Missing 'prompt'", "missing_prompt"), 400);
+    const responseFormat = normalizeImageResponseFormat(body.response_format);
+    if (!responseFormat)
+      return c.json(openAiError("Invalid 'response_format', expected 'url' or 'b64_json'", "invalid_response_format"), 400);
+    const warning = hasResolutionDowngradeWarning(body.image_config);
 
-    requestedModel = String(body.model ?? "grok-imagine-1.0").trim() || "grok-imagine-1.0";
+    requestedModel = String(body.model ?? "grok-imagine").trim() || "grok-imagine";
     if (!isValidModel(requestedModel))
       return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
     const cfg = MODEL_CONFIG[requestedModel]!;
@@ -457,9 +907,87 @@ openAiRoutes.post("/images/generations", async (c) => {
 
     const settingsBundle = await getSettings(c.env);
     const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+    const baseUrl = (settingsBundle.global.base_url ?? "").trim() || origin;
+
+    if (cfg.transport === "ws_imagine") {
+      let aspectRatio: "1:1" | "2:3" | "3:2" | "9:16" | "16:9";
+      try {
+        aspectRatio = resolveImagineAspectRatio({ size: body.size, imageConfig: body.image_config });
+      } catch (e) {
+        return c.json(openAiError(e instanceof Error ? e.message : "Invalid image_config.aspect_ratio", "invalid_aspect_ratio"), 400);
+      }
+
+      try {
+        const generated = await generateImagineWsWithRetries({
+          env: c.env,
+          settings: settingsBundle,
+          requestedModel,
+          prompt,
+          aspectRatio,
+          n,
+        });
+
+        const rawUrls = generated.urls.slice(0, n);
+        if (!rawUrls.length && responseFormat === "url")
+          throw new Error("No image URL returned from imagine WS");
+        const encoded = rawUrls.map((u) => encodeAssetPath(u));
+        scheduleImagePrefetch(c, origin, encoded);
+
+        let data: Array<{ url?: string; b64_json?: string }> = [];
+        if (responseFormat === "url") {
+          data = encoded.map((path) => ({ url: toProxyUrl(baseUrl, path) }));
+        } else {
+          const b64List = generated.b64List
+            .map((item) => String(item ?? "").trim())
+            .filter(Boolean)
+            .slice(0, n);
+
+          if (b64List.length < n && encoded.length) {
+            const fetched = await mapLimit(encoded, 2, async (path) => fetchProxyImageAsBase64(origin, path));
+            for (const one of fetched) {
+              if (b64List.length >= n) break;
+              b64List.push(one);
+            }
+          }
+
+          if (!b64List.length) throw new Error("No b64_json returned from imagine WS");
+          data = b64List.map((b64_json) => ({ b64_json }));
+        }
+
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status: 200,
+          key_name: keyName,
+          token_suffix: generated.tokenSuffix,
+          error: "",
+        });
+
+        const res = c.json({
+          created: Math.floor(Date.now() / 1000),
+          data,
+        });
+        return withOptionalWarningHeader(res, warning);
+      } catch (e) {
+        const msg = imagineErrorMessage(e);
+        const status = imagineErrorStatus(e);
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status,
+          key_name: keyName,
+          token_suffix: "",
+          error: msg,
+        });
+        return c.json(openAiError(msg, "upstream_error"), (status || 500) as any);
+      }
+    }
 
     const calls = Math.ceil(n / 2);
-    const baseUrl = (settingsBundle.global.base_url ?? "").trim() || origin;
 
     const doOne = async (): Promise<string[]> => {
       const chosen = await selectBestToken(c.env.DB, requestedModel);
@@ -484,13 +1012,21 @@ openAiRoutes.post("/images/generations", async (c) => {
         await applyCooldown(c.env.DB, chosen.token, upstream.status);
         throw new Error(`Upstream ${upstream.status}: ${txt.slice(0, 200)}`);
       }
-      const rawUrls = await collectGeneratedImageUrls(upstream);
-      return rawUrls.map((u) => toProxyUrl(baseUrl, encodeAssetPath(u)));
+      return collectGeneratedImageUrls(upstream);
     };
 
-    const urlsNested = await mapLimit(Array.from({ length: calls }).map((_, i) => i), 3, async () => doOne());
-    const urls = urlsNested.flat().filter(Boolean);
-    const selected = urls.slice(0, n);
+    const rawUrlsNested = await mapLimit(Array.from({ length: calls }).map((_, i) => i), 3, async () => doOne());
+    const rawUrls = rawUrlsNested.flat().filter(Boolean).slice(0, n);
+    const encoded = rawUrls.map((u) => encodeAssetPath(u));
+    scheduleImagePrefetch(c, origin, encoded);
+
+    let data: Array<{ url?: string; b64_json?: string }> = [];
+    if (responseFormat === "url") {
+      data = encoded.map((path) => ({ url: toProxyUrl(baseUrl, path) }));
+    } else {
+      const b64 = await mapLimit(encoded, 2, async (path) => fetchProxyImageAsBase64(origin, path));
+      data = b64.map((b64_json) => ({ b64_json }));
+    }
 
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {
@@ -503,10 +1039,11 @@ openAiRoutes.post("/images/generations", async (c) => {
       error: "",
     });
 
-    return c.json({
+    const res = c.json({
       created: Math.floor(Date.now() / 1000),
-      data: selected.map((url) => ({ url })),
+      data,
     });
+    return withOptionalWarningHeader(res, warning);
   } catch (e) {
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {

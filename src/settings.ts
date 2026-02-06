@@ -19,6 +19,11 @@ export interface GrokSettings {
   proxy_pool_interval?: number;
   cache_proxy_url?: string;
   cf_clearance?: string; // stored as VALUE only (no "cf_clearance=" prefix)
+  imagine_auto_age_verify?: boolean;
+  imagine_enable_nsfw?: boolean;
+  imagine_birth_date?: string;
+  imagine_max_retries?: number;
+  imagine_blocked_retry_limit?: number;
   x_statsig_id?: string;
   dynamic_statsig?: boolean;
   filtered_tags?: string;
@@ -95,6 +100,11 @@ const DEFAULTS: SettingsBundle = {
     proxy_pool_interval: 300,
     cache_proxy_url: "",
     cf_clearance: "",
+    imagine_auto_age_verify: true,
+    imagine_enable_nsfw: true,
+    imagine_birth_date: "2001-01-01T16:00:00.000Z",
+    imagine_max_retries: 5,
+    imagine_blocked_retry_limit: 3,
     x_statsig_id: "",
     dynamic_statsig: true,
     filtered_tags: "xaiartifact,xai:tool_usage_card",

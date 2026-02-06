@@ -224,3 +224,16 @@ region = "aws:us-east-1"
 
 如需调整：把 `region` 改成你想要的区域（例如 `aws:us-west-2`）。
 如需关闭：删除 `wrangler.toml` 中的 `[placement]` 段落即可（恢复默认的边缘就近执行）。
+
+## Imagine Update Notes
+
+- `grok-imagine` now uses the built-in Worker imagine pipeline (direct Grok WebSocket).
+- `grok-imagine-1.0` and `grok-imagine-1.0-video` remain legacy models for backward compatibility.
+- New settings: `grok.imagine_auto_age_verify`, `grok.imagine_enable_nsfw`, `grok.imagine_birth_date`, `grok.imagine_max_retries`, `grok.imagine_blocked_retry_limit`.
+- `/v1/images/generations` now supports `response_format=url|b64_json`.
+- `size` is mapped to aspect ratio; `image_config.aspect_ratio` overrides `size`.
+- `image_config.resolution` is accepted but currently downgraded (response header `x-grok2api-warning`).
+- `/v1/chat/completions` with `model=grok-imagine` returns Markdown image links (`stream=true` sends progress text first, then final Markdown).
+- Generated images are asynchronously prefetched into KV cache after response.
+- Cache page opens `/images/*` directly to avoid `/v1/*` auth interception.
+- Legacy `/v1/files/image/*` and `/v1/files/video/*` routes are still available and redirect to `/images/*`.

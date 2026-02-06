@@ -189,7 +189,12 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         base_proxy_url: String(settings.grok.proxy_url ?? ""),
         asset_proxy_url: String(settings.grok.cache_proxy_url ?? ""),
         cf_clearance: String(settings.grok.cf_clearance ?? ""),
-        max_retry: 3,
+        imagine_auto_age_verify: settings.grok.imagine_auto_age_verify !== false,
+        imagine_enable_nsfw: settings.grok.imagine_enable_nsfw !== false,
+        imagine_birth_date: String(settings.grok.imagine_birth_date ?? "2001-01-01T16:00:00.000Z"),
+        imagine_max_retries: Number(settings.grok.imagine_max_retries ?? 5),
+        imagine_blocked_retry_limit: Number(settings.grok.imagine_blocked_retry_limit ?? 3),
+        max_retry: Number(settings.grok.imagine_max_retries ?? 5),
         retry_status_codes: Array.isArray(settings.grok.retry_status_codes) ? settings.grok.retry_status_codes : [401, 429, 403],
       },
       token: {
@@ -244,6 +249,18 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof grokCfg.base_proxy_url === "string") grok_config.proxy_url = grokCfg.base_proxy_url.trim();
       if (typeof grokCfg.asset_proxy_url === "string") grok_config.cache_proxy_url = grokCfg.asset_proxy_url.trim();
       if (typeof grokCfg.cf_clearance === "string") grok_config.cf_clearance = grokCfg.cf_clearance.trim();
+      if (typeof grokCfg.imagine_auto_age_verify === "boolean")
+        grok_config.imagine_auto_age_verify = grokCfg.imagine_auto_age_verify;
+      if (typeof grokCfg.imagine_enable_nsfw === "boolean")
+        grok_config.imagine_enable_nsfw = grokCfg.imagine_enable_nsfw;
+      if (typeof grokCfg.imagine_birth_date === "string")
+        grok_config.imagine_birth_date = grokCfg.imagine_birth_date.trim();
+      if (Number.isFinite(Number(grokCfg.imagine_max_retries)))
+        grok_config.imagine_max_retries = Math.max(1, Math.floor(Number(grokCfg.imagine_max_retries)));
+      if (Number.isFinite(Number(grokCfg.imagine_blocked_retry_limit)))
+        grok_config.imagine_blocked_retry_limit = Math.max(0, Math.floor(Number(grokCfg.imagine_blocked_retry_limit)));
+      if (Number.isFinite(Number(grokCfg.max_retry)))
+        grok_config.imagine_max_retries = Math.max(1, Math.floor(Number(grokCfg.max_retry)));
       if (typeof grokCfg.filter_tags === "string") {
         grok_config.filtered_tags = grokCfg.filter_tags;
       } else if (Array.isArray(grokCfg.filter_tags)) {
