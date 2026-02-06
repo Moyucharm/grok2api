@@ -16,6 +16,7 @@ export interface OpenAIChatRequestBody {
     video_length?: number;
     resolution?: string;
     preset?: string;
+    is_video_edit?: boolean;
   };
 }
 
@@ -79,6 +80,7 @@ export function buildConversationPayload(args: {
     video_length?: number;
     resolution?: string;
     preset?: string;
+    is_video_edit?: boolean;
   };
   settings: GrokSettings;
 }): { payload: Record<string, unknown>; referer?: string; isVideoModel: boolean } {
@@ -92,19 +94,30 @@ export function buildConversationPayload(args: {
     const aspectRatio = (args.videoConfig?.aspect_ratio ?? "").trim() || "3:2";
     const videoLengthRaw = Number(args.videoConfig?.video_length ?? 6);
     const videoLength = Number.isFinite(videoLengthRaw) ? Math.max(1, Math.floor(videoLengthRaw)) : 6;
-    const resolution = (args.videoConfig?.resolution ?? "SD") === "HD" ? "HD" : "SD";
+    const resolutionRaw = String(args.videoConfig?.resolution ?? "").trim().toLowerCase();
+    const resolutionName = resolutionRaw === "1080p" || resolutionRaw === "hd" ? "1080p" : "720p";
+    const isVideoEdit = Boolean(args.videoConfig?.is_video_edit);
     const preset = (args.videoConfig?.preset ?? "normal").trim();
+    const enableNsfw = settings.imagine_enable_nsfw !== false;
 
     let modeFlag = "--mode=custom";
     if (preset === "fun") modeFlag = "--mode=extremely-crazy";
     else if (preset === "normal") modeFlag = "--mode=normal";
     else if (preset === "spicy") modeFlag = "--mode=extremely-spicy-or-crazy";
 
-    const prompt = `${String(content || "").trim()} ${modeFlag}`.trim();
+    const imageUrl = (() => {
+      const raw = String(imgUris[0] ?? "").trim();
+      if (!raw) return "";
+      if (/^https?:\/\//i.test(raw)) return raw;
+      return raw.startsWith("/") ? `https://assets.grok.com${raw}` : `https://assets.grok.com/${raw}`;
+    })();
+    const promptBase = String(content || "").trim();
+    const promptWithImage = imageUrl ? `${imageUrl} ${promptBase}`.trim() : promptBase;
+    const prompt = `${promptWithImage} ${modeFlag}`.trim();
 
     return {
       isVideoModel: true,
-      referer: "https://grok.com/imagine",
+      referer: postId ? `https://grok.com/imagine/post/${postId}` : "https://grok.com/imagine",
       payload: {
         temporary: true,
         modelName: "grok-3",
@@ -119,7 +132,14 @@ export function buildConversationPayload(args: {
                 parentPostId: postId,
                 aspectRatio,
                 videoLength,
-                videoResolution: resolution,
+                resolutionName,
+                videoResolution: resolutionName === "1080p" ? "HD" : "SD",
+                isVideoEdit,
+                is_video_edit: isVideoEdit,
+                enableNsfw,
+                enable_nsfw: enableNsfw,
+                isKidsMode: false,
+                is_kids_mode: false,
               },
             },
           },

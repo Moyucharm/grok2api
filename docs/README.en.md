@@ -112,10 +112,11 @@ Required config keys (Admin -> Config, `register.*`):
 | `grok-4.1` | 1 | Basic/Super | Yes | Yes | - |
 | `grok-4.1-thinking` | 4 | Basic/Super | Yes | Yes | - |
 | `grok-imagine` | 4 | Basic/Super | Yes (image-chat) | Yes | - |
+| `grok-imagine-video` | - | Basic/Super | - | - | Yes |
 | `grok-imagine-1.0` | 4 | Basic/Super | - | Yes | - |
 | `grok-imagine-1.0-video` | - | Basic/Super | - | - | Yes |
 
-`grok-imagine` uses the built-in Worker imagine pipeline (direct Grok WebSocket). `grok-imagine-1.0` / `grok-imagine-1.0-video` remain legacy models.
+`grok-imagine` and `grok-imagine-video` use built-in imagine pipelines. `grok-imagine-1.0` / `grok-imagine-1.0-video` remain legacy models.
 You can configure imagine behavior in settings: `imagine_auto_age_verify`, `imagine_enable_nsfw`, `imagine_birth_date`, `imagine_max_retries`, `imagine_blocked_retry_limit`.
 
 <br>

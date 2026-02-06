@@ -1,7 +1,7 @@
 export interface ModelInfo {
   grok_model: [string, string];
   rate_limit_model: string;
-  transport?: "legacy_rest" | "ws_imagine";
+  transport?: "legacy_rest" | "ws_imagine" | "imagine_video";
   display_name: string;
   description: string;
   raw_model_path: string;
@@ -157,6 +157,19 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
     display_name: "Grok Imagine 1.0 Video",
     description: "Video generation model (legacy conversation pipeline)",
     raw_model_path: "xai/grok-imagine-1.0-video",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    is_video_model: true,
+  },
+  "grok-imagine-video": {
+    grok_model: ["grok-imagine", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-3",
+    transport: "imagine_video",
+    display_name: "Grok Imagine Video",
+    description: "Video generation model (imagine pipeline)",
+    raw_model_path: "xai/grok-imagine-video",
     default_temperature: 1.0,
     default_max_output_tokens: 8192,
     supported_max_output_tokens: 131072,

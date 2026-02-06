@@ -33,6 +33,36 @@ function openAiError(message: string, code: string): Record<string, unknown> {
   return { error: { message, type: "invalid_request_error", code } };
 }
 
+function makeOpenAiErrorSse(message: string, model: string): Response {
+  const created = Math.floor(Date.now() / 1000);
+  const id = `chatcmpl-${crypto.randomUUID()}`;
+  const chunk1 = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: { role: "assistant", content: String(message || "Upstream error") }, finish_reason: null }],
+  };
+  const chunk2 = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  };
+  const body = `data: ${JSON.stringify(chunk1)}\n\ndata: ${JSON.stringify(chunk2)}\n\ndata: [DONE]\n\n`;
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
 function getClientIp(req: Request): string {
   return (
     req.headers.get("CF-Connecting-IP") ||
@@ -323,6 +353,116 @@ async function generateImagineWsWithRetries(args: {
   });
 }
 
+async function createImagineVideoUpstreamWithRetries(args: {
+  env: Env;
+  settings: SettingsBundle;
+  requestedModel: string;
+  prompt: string;
+  imageInputs: string[];
+  videoConfig?: {
+    aspect_ratio?: string;
+    video_length?: number;
+    resolution?: string;
+    preset?: string;
+  };
+}): Promise<{ upstream: Response; cookie: string; tokenSuffix: string }> {
+  const retryCodes = Array.isArray(args.settings.grok.retry_status_codes)
+    ? args.settings.grok.retry_status_codes
+    : [401, 429, 403];
+  const maxRetries = Math.max(1, Math.floor(Number(args.settings.grok.imagine_max_retries ?? 5)));
+  const autoAgeVerify = args.settings.grok.imagine_auto_age_verify !== false;
+  const birthDate = ensureBirthDate(String(args.settings.grok.imagine_birth_date ?? ""));
+  const cf = normalizeCfCookie(args.settings.grok.cf_clearance ?? "");
+
+  let lastErr: unknown = null;
+  let lastStatus = 500;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const chosen = await selectBestToken(args.env.DB, args.requestedModel);
+    if (!chosen) throw new Error("No available token");
+
+    const jwt = chosen.token;
+    const cookie = buildGrokCookie(jwt, cf);
+    const safePrompt = args.prompt.trim() || "Generate a video";
+
+    if (autoAgeVerify) {
+      const verified = await getTokenAgeVerified(args.env.DB, jwt);
+      if (!verified) {
+        const ok = await verifyImagineAge({ cookie, birthDate });
+        if (ok) await setTokenAgeVerified(args.env.DB, jwt, true);
+      }
+    }
+
+    try {
+      const imgInputs = args.imageInputs.length ? [args.imageInputs[0]!] : [];
+      const uploads = await mapLimit(imgInputs, 1, (u) => uploadImage(u, cookie, args.settings.grok));
+      const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
+      const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
+
+      let postId: string | undefined;
+      if (imgUris.length) {
+        const post = await createPost(imgUris[0]!, cookie, args.settings.grok);
+        postId = post.postId || undefined;
+      } else {
+        const post = await createMediaPost(
+          { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: safePrompt },
+          cookie,
+          args.settings.grok,
+        );
+        postId = post.postId || undefined;
+      }
+
+      const { payload, referer } = buildConversationPayload({
+        requestModel: args.requestedModel,
+        content: safePrompt,
+        imgIds,
+        imgUris,
+        ...(postId ? { postId } : {}),
+        ...(args.videoConfig ? { videoConfig: args.videoConfig } : {}),
+        settings: args.settings.grok,
+      });
+
+      const upstream = await sendConversationRequest({
+        payload,
+        cookie,
+        settings: args.settings.grok,
+        ...(referer ? { referer } : {}),
+      });
+
+      if (upstream.ok) return { upstream, cookie, tokenSuffix: jwt.slice(-6) };
+
+      const txt = await upstream.text().catch(() => "");
+      const msg = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
+      lastErr = new ImagineWsError(msg, {
+        code: "imagine_video_upstream_error",
+        status: upstream.status,
+        retryable: retryCodes.includes(upstream.status),
+      });
+      lastStatus = upstream.status;
+      await recordTokenFailure(args.env.DB, jwt, upstream.status, txt.slice(0, 200));
+      await applyCooldown(args.env.DB, jwt, upstream.status);
+
+      if (retryCodes.includes(upstream.status) && attempt < maxRetries - 1) continue;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      lastStatus = imagineErrorStatus(err);
+      await recordTokenFailure(args.env.DB, jwt, lastStatus, msg.slice(0, 200));
+      await applyCooldown(args.env.DB, jwt, lastStatus);
+      if (attempt < maxRetries - 1) continue;
+      break;
+    }
+  }
+
+  if (lastErr instanceof Error) throw lastErr;
+  throw new ImagineWsError("Video generation failed", {
+    code: "imagine_video_failed",
+    status: lastStatus,
+    retryable: false,
+  });
+}
+
 async function enforceQuota(args: {
   env: Env;
   apiAuth: ApiAuthInfo;
@@ -569,6 +709,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             const chunkId = `chatcmpl-${crypto.randomUUID()}`;
             const created = Math.floor(Date.now() / 1000);
             let sentRole = false;
+            let thinkOpened = false;
             const stageName: Record<string, string> = {
               preview: "preview",
               medium: "medium",
@@ -595,7 +736,8 @@ openAiRoutes.post("/chat/completions", async (c) => {
             const done = () => controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 
             try {
-              push("Generating image(s)...\n");
+              push("<think>\nGenerating image(s)...\n");
+              thinkOpened = true;
               const generated = await generateImagineWsWithRetries({
                 env: c.env,
                 settings: settingsBundle,
@@ -604,7 +746,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
                 aspectRatio,
                 n: imagineImageCount,
                 onProgress: async (event) => {
-                  const key = `${event.image_id}:${event.stage}`;
+                  const key = `${event.completed}/${event.total}:${event.stage}`;
                   if (emitted.has(key)) return;
                   emitted.add(key);
                   const stage = stageName[event.stage] ?? event.stage;
@@ -615,6 +757,10 @@ openAiRoutes.post("/chat/completions", async (c) => {
               if (!generated.urls.length) throw new Error("No image URL returned from imagine WS");
               const encoded = generated.urls.map((u) => encodeAssetPath(u));
               scheduleImagePrefetch(c, origin, encoded);
+              if (thinkOpened) {
+                push("</think>\n");
+                thinkOpened = false;
+              }
               push(markdownFromRawImageUrls({ baseUrl, rawUrls: generated.urls }), "stop");
               done();
               await addRequestLog(c.env.DB, {
@@ -631,6 +777,10 @@ openAiRoutes.post("/chat/completions", async (c) => {
             } catch (e) {
               const msg = imagineErrorMessage(e);
               const status = imagineErrorStatus(e);
+              if (thinkOpened) {
+                push("</think>\n");
+                thinkOpened = false;
+              }
               push(`Error: ${msg}`, "stop");
               done();
               await addRequestLog(c.env.DB, {
@@ -712,6 +862,91 @@ openAiRoutes.post("/chat/completions", async (c) => {
           token_suffix: "",
           error: lastErr,
         });
+        if (stream) return makeOpenAiErrorSse(lastErr, requestedModel);
+        return c.json(openAiError(lastErr, "upstream_error"), (status || 500) as any);
+      }
+    }
+
+    if (cfg.transport === "imagine_video") {
+      const { content, images } = extractContent(body.messages as any);
+      const prompt = String(content ?? "").trim() || "Generate a video";
+      const imageInputs = images.slice(0, 1);
+
+      try {
+        const generated = await createImagineVideoUpstreamWithRetries({
+          env: c.env,
+          settings: settingsBundle,
+          requestedModel,
+          prompt,
+          imageInputs,
+          ...(body.video_config ? { videoConfig: body.video_config } : {}),
+        });
+
+        if (stream) {
+          const sse = createOpenAiStreamFromGrokNdjson(generated.upstream, {
+            cookie: generated.cookie,
+            settings: settingsBundle.grok,
+            global: settingsBundle.global,
+            origin,
+            requestedModel,
+            onFinish: async ({ status, duration }) => {
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(duration.toFixed(2)),
+                status,
+                key_name: keyName,
+                token_suffix: generated.tokenSuffix,
+                error: status === 200 ? "" : "stream_error",
+              });
+            },
+          });
+
+          return new Response(sse, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+              "X-Accel-Buffering": "no",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        }
+
+        const json = await parseOpenAiFromGrokNdjson(generated.upstream, {
+          cookie: generated.cookie,
+          settings: settingsBundle.grok,
+          global: settingsBundle.global,
+          origin,
+          requestedModel,
+        });
+
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status: 200,
+          key_name: keyName,
+          token_suffix: generated.tokenSuffix,
+          error: "",
+        });
+
+        return c.json(json);
+      } catch (e) {
+        lastErr = imagineErrorMessage(e);
+        const status = imagineErrorStatus(e);
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status,
+          key_name: keyName,
+          token_suffix: "",
+          error: lastErr,
+        });
         return c.json(openAiError(lastErr, "upstream_error"), (status || 500) as any);
       }
     }
@@ -780,6 +1015,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             settings: settingsBundle.grok,
             global: settingsBundle.global,
             origin,
+            requestedModel,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,

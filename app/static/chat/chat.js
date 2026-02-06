@@ -260,7 +260,10 @@ async function refreshModels() {
       if (filtered.some((m) => String(m.id || '') === 'grok-imagine')) sel.value = 'grok-imagine';
       else if (filtered.some((m) => String(m.id || '') === 'grok-imagine-1.0')) sel.value = 'grok-imagine-1.0';
     }
-    else if (currentTab === 'video') sel.value = 'grok-imagine-1.0-video';
+    else if (currentTab === 'video') {
+      if (filtered.some((m) => String(m.id || '') === 'grok-imagine-video')) sel.value = 'grok-imagine-video';
+      else sel.value = 'grok-imagine-1.0-video';
+    }
     else sel.value = sel.value || 'grok-4-fast';
   } catch (e) {
     showToast('加载模型失败: ' + (e?.message || e), 'error');
@@ -446,7 +449,7 @@ async function generateVideo() {
   const prompt = String(q('video-prompt').value || '').trim();
   if (!prompt) return showToast('请输入 prompt', 'warning');
 
-  const model = String(q('model-select').value || 'grok-imagine-1.0-video').trim();
+  const model = String(q('model-select').value || 'grok-imagine-video').trim();
   const stream = Boolean(q('stream-toggle').checked);
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');

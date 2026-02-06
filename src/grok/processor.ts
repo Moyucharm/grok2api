@@ -1,4 +1,4 @@
-import type { GrokSettings, GlobalSettings } from "../settings";
+﻿import type { GrokSettings, GlobalSettings } from "../settings";
 
 type GrokNdjson = Record<string, unknown>;
 
@@ -42,6 +42,70 @@ function makeChunk(
 
 function makeDone(): string {
   return "data: [DONE]\n\n";
+}
+
+function toTrimmedString(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function hasPolicyKeyword(text: string): boolean {
+  const t = text.toLowerCase();
+  const keywords = [
+    "block",
+    "blocked",
+    "deny",
+    "denied",
+    "reject",
+    "rejected",
+    "moderat",
+    "policy",
+    "unsafe",
+    "restricted",
+    "not allowed",
+    "violation",
+    "review",
+    "content policy",
+    "safety policy",
+    "not available",
+    "insufficient balance",
+    "quota",
+    "credit",
+  ];
+  return keywords.some((k) => t.includes(k));
+}
+
+function shorten(text: string, max = 240): string {
+  const s = text.trim();
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}...`;
+}
+
+function detectVideoBlockReason(grok: Record<string, unknown> | null | undefined): string {
+  if (!grok) return "";
+
+  const videoResp = (grok as { streamingVideoGenerationResponse?: Record<string, unknown> }).streamingVideoGenerationResponse;
+  const modelResp = (grok as { modelResponse?: Record<string, unknown> }).modelResponse;
+
+  const status = toTrimmedString(videoResp?.status);
+  if (status && hasPolicyKeyword(status)) {
+    return `Video generation was blocked by upstream (${status}).`;
+  }
+
+  const candidates: string[] = [
+    toTrimmedString(videoResp?.error),
+    toTrimmedString(videoResp?.errorMessage),
+    toTrimmedString(videoResp?.blockedReason),
+    toTrimmedString(videoResp?.deniedReason),
+    toTrimmedString(videoResp?.reason),
+    toTrimmedString(modelResp?.error),
+    toTrimmedString((grok as { error?: { message?: unknown } }).error?.message),
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    if (hasPolicyKeyword(c)) return `Video generation was blocked by upstream safety review: ${shorten(c)}`;
+  }
+
+  return "";
 }
 
 function toImgProxyUrl(globalCfg: GlobalSettings, origin: string, path: string): string {
@@ -121,6 +185,7 @@ export function createOpenAiStreamFromGrokNdjson(
     settings: GrokSettings;
     global: GlobalSettings;
     origin: string;
+    requestedModel?: string;
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
 ): ReadableStream<Uint8Array> {
@@ -163,10 +228,21 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      let videoFrameSeen = false;
+      let videoAssetEmitted = false;
+      let videoBlockedReason = "";
+      const isVideoRequest = /video/i.test(String(opts.requestedModel ?? ""));
 
       let buffer = "";
 
       const flushStop = () => {
+        if (isVideoRequest && !videoAssetEmitted) {
+          finalStatus = 422;
+          const reason =
+            videoBlockedReason ||
+            "Video generation did not return a playable asset. It may have been blocked by upstream safety review.";
+          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, `${reason}\n`)));
+        }
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
       };
@@ -251,6 +327,9 @@ export function createOpenAiStreamFromGrokNdjson(
             // Video generation stream
             const videoResp = grok.streamingVideoGenerationResponse;
             if (videoResp) {
+              videoFrameSeen = true;
+              const reason = detectVideoBlockReason(grok as Record<string, unknown>);
+              if (reason) videoBlockedReason = reason;
               const progress = typeof videoResp.progress === "number" ? videoResp.progress : 0;
               const videoUrl = typeof videoResp.videoUrl === "string" ? videoResp.videoUrl : "";
               const thumbUrl = typeof videoResp.thumbnailImageUrl === "string" ? videoResp.thumbnailImageUrl : "";
@@ -260,18 +339,19 @@ export function createOpenAiStreamFromGrokNdjson(
                 if (showThinking) {
                   let msg = "";
                   if (!videoProgressStarted) {
-                    msg = `<think>视频已生成${progress}%\n`;
+                    msg = `<think>\nVideo generation progress: ${progress}%\n`;
                     videoProgressStarted = true;
                   } else if (progress < 100) {
-                    msg = `视频已生成${progress}%\n`;
+                    msg = `Video generation progress: ${progress}%\n`;
                   } else {
-                    msg = `视频已生成${progress}%</think>\n`;
+                    msg = `Video generation progress: ${progress}%\n</think>\n`;
                   }
                   controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, msg)));
                 }
               }
 
               if (videoUrl) {
+                videoAssetEmitted = true;
                 const videoPath = encodeAssetPath(videoUrl);
                 const src = toImgProxyUrl(global, origin, videoPath);
 
@@ -297,6 +377,20 @@ export function createOpenAiStreamFromGrokNdjson(
                 );
               }
               continue;
+            }
+
+            if (isVideoRequest) {
+              const modelResp = grok.modelResponse;
+              if (typeof modelResp?.error === "string" && modelResp.error.trim()) {
+                finalStatus = 422;
+                const reason = `Video generation was blocked by upstream safety review: ${shorten(modelResp.error)}`;
+                videoBlockedReason = reason;
+                controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, `${reason}\n`, "stop")));
+                controller.enqueue(encoder.encode(makeDone()));
+                if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+                controller.close();
+                return;
+              }
             }
 
             if (grok.imageAttachmentInfo) isImage = true;
@@ -377,15 +471,14 @@ export function createOpenAiStreamFromGrokNdjson(
           }
         }
 
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
-        controller.enqueue(encoder.encode(makeDone()));
+        flushStop();
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
         controller.close();
       } catch (e) {
         finalStatus = 500;
         controller.enqueue(
           encoder.encode(
-            makeChunk(id, created, currentModel, `处理错误: ${e instanceof Error ? e.message : String(e)}`, "error"),
+            makeChunk(id, created, currentModel, `澶勭悊閿欒: ${e instanceof Error ? e.message : String(e)}`, "error"),
           ),
         );
         controller.enqueue(encoder.encode(makeDone()));
@@ -412,6 +505,9 @@ export async function parseOpenAiFromGrokNdjson(
 
   let content = "";
   let model = requestedModel;
+  const isVideoRequest = /video/i.test(requestedModel);
+  let videoFrameSeen = false;
+  let videoBlockedReason = "";
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -427,6 +523,11 @@ export async function parseOpenAiFromGrokNdjson(
     if (!grok) continue;
 
     const videoResp = grok.streamingVideoGenerationResponse;
+    if (videoResp) {
+      videoFrameSeen = true;
+      const reason = detectVideoBlockReason(grok as Record<string, unknown>);
+      if (reason) videoBlockedReason = reason;
+    }
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
       const videoPath = encodeAssetPath(videoResp.videoUrl);
       const src = toImgProxyUrl(global, origin, videoPath);
@@ -448,7 +549,13 @@ export async function parseOpenAiFromGrokNdjson(
 
     const modelResp = grok.modelResponse;
     if (!modelResp) continue;
-    if (typeof modelResp.error === "string" && modelResp.error) throw new Error(modelResp.error);
+    if (typeof modelResp.error === "string" && modelResp.error) {
+      if (isVideoRequest || videoFrameSeen) {
+        videoBlockedReason = `Video generation was blocked by upstream safety review: ${shorten(modelResp.error)}`;
+        continue;
+      }
+      throw new Error(modelResp.error);
+    }
 
     if (typeof modelResp.model === "string" && modelResp.model) model = modelResp.model;
     if (typeof modelResp.message === "string") content = modelResp.message;
@@ -471,6 +578,13 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
+  if ((isVideoRequest || videoFrameSeen) && !content.trim()) {
+    content =
+      videoBlockedReason ||
+      "Video generation did not return a playable asset. It may have been blocked by upstream safety review.";
+    model = requestedModel;
+  }
+
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,
     object: "chat.completion",
@@ -486,3 +600,5 @@ export async function parseOpenAiFromGrokNdjson(
     usage: null,
   };
 }
+
+

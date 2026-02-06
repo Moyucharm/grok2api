@@ -267,6 +267,7 @@ curl http://localhost:8000/v1/images/generations \
 ## Worker Imagine Update
 
 - `grok-imagine` now uses the built-in Worker imagine pipeline (direct Grok WebSocket).
+- `grok-imagine-video` added for imagine video generation (new pipeline).
 - `grok-imagine-1.0` and `grok-imagine-1.0-video` remain legacy models for backward compatibility.
 - New settings: `grok.imagine_auto_age_verify`, `grok.imagine_enable_nsfw`, `grok.imagine_birth_date`, `grok.imagine_max_retries`, `grok.imagine_blocked_retry_limit`.
 - `/v1/images/generations` supports:
