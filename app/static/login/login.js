@@ -1,41 +1,60 @@
+const usernameInput = document.getElementById('username-input');
+const passwordInput = document.getElementById('password-input');
 const apiKeyInput = document.getElementById('api-key-input');
-if (apiKeyInput) {
-  apiKeyInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') login();
-  });
+
+function buildCreds() {
+  if (passwordInput) {
+    const username = (usernameInput ? usernameInput.value : '').trim() || 'admin';
+    const password = passwordInput.value.trim();
+    return { username, password };
+  }
+
+  const password = (apiKeyInput ? apiKeyInput.value : '').trim();
+  return { username: 'admin', password };
 }
 
-async function requestLogin(key) {
+async function requestLogin(creds) {
   const res = await fetch('/api/v1/admin/login', {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${key}` }
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(creds),
   });
   return res.ok;
 }
 
+function bindEnter(el) {
+  if (!el) return;
+  el.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') login();
+  });
+}
+
+bindEnter(usernameInput);
+bindEnter(passwordInput);
+bindEnter(apiKeyInput);
+
 async function login() {
-  const input = (apiKeyInput ? apiKeyInput.value : '').trim();
-  if (!input) return;
+  const creds = buildCreds();
+  if (!creds.password) return;
 
   try {
-    const ok = await requestLogin(input);
+    const ok = await requestLogin(creds);
     if (ok) {
-      await storeAppKey(input);
+      await storeAppKey(creds);
       window.location.href = '/admin/token';
     } else {
-      showToast('用户名或密码错误', 'error');
+      showToast('Invalid username or password', 'error');
     }
   } catch (e) {
-    showToast('连接失败', 'error');
+    showToast('Connection failed', 'error');
   }
 }
 
-// Auto-redirect checks
 (async () => {
-  const existingKey = await getStoredAppKey();
-  if (!existingKey) return;
+  const existingCreds = await getStoredAppKey();
+  if (!existingCreds || !existingCreds.password) return;
   try {
-    const ok = await requestLogin(existingKey);
+    const ok = await requestLogin(existingCreds);
     if (ok) window.location.href = '/admin/token';
   } catch (e) {
     return;

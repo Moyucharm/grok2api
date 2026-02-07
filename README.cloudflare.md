@@ -227,14 +227,21 @@ region = "aws:us-east-1"
 
 ## Imagine Update Notes
 
-- `grok-imagine` now uses the built-in Worker imagine pipeline (direct Grok WebSocket).
 - `grok-imagine-video` added for imagine video generation (new pipeline).
-- `grok-imagine-1.0` and `grok-imagine-1.0-video` remain legacy models for backward compatibility.
+- `grok-imagine-1.0` now defaults to the WebSocket imagine pipeline.
+- `grok-imagine-1.0-edit` is available in model list for image edits.
+- Legacy image alias `grok-imagine` is removed on Workers. Use `grok-imagine-1.0`.
+- `/v1/images/edits` is available (multipart/form-data, `model=grok-imagine-1.0-edit`).
 - New settings: `grok.imagine_auto_age_verify`, `grok.imagine_enable_nsfw`, `grok.imagine_birth_date`, `grok.imagine_max_retries`, `grok.imagine_blocked_retry_limit`.
 - `/v1/images/generations` now supports `response_format=url|b64_json`.
+- `/v1/images/generations` default model is `grok-imagine-1.0` (WS imagine pipeline).
 - `size` is mapped to aspect ratio; `image_config.aspect_ratio` overrides `size`.
 - `image_config.resolution` is accepted but currently downgraded (response header `x-grok2api-warning`).
-- `/v1/chat/completions` with `model=grok-imagine` returns Markdown image links (`stream=true` sends progress text first, then final Markdown).
+- `/v1/chat/completions` with `model=grok-imagine-1.0` returns Markdown image links (`stream=true` sends progress text first, then final Markdown).
 - Generated images are asynchronously prefetched into KV cache after response.
 - Cache page opens `/images/*` directly to avoid `/v1/*` auth interception.
 - Legacy `/v1/files/image/*` and `/v1/files/video/*` routes are still available and redirect to `/images/*`.
+- Admin API compatibility:
+  - Added `/api/v1/admin/tokens/auto-register`, `/status`, `/stop` (Cloudflare runtime returns explicit unsupported status in job logs).
+  - Added `/api/v1/admin/cache/online/load/async` and `/api/v1/admin/cache/online/clear/async` to match frontend async calls.
+  - Added `/api/v1/admin/voice/token` and returns `501` with clear unsupported message on Workers.

@@ -14,13 +14,17 @@ import {
   updateApiKeyStatus,
 } from "../repo/apiKeys";
 import { displayKey } from "../utils/crypto";
-import { createAdminSession, deleteAdminSession } from "../repo/adminSessions";
+import { createAdminSession, deleteAdminSession, verifyAdminSession } from "../repo/adminSessions";
 import {
+  applyCooldown,
   addTokens,
   deleteTokens,
+  getTokenAgeVerified,
   getAllTags,
   listTokens,
   markTokenRecovered,
+  recordTokenFailure,
+  selectBestToken,
   setTokenAgeVerified,
   tokenRowToInfo,
   updateTokenNote,
@@ -28,7 +32,7 @@ import {
   updateTokenLimits,
 } from "../repo/tokens";
 import { checkRateLimits } from "../grok/rateLimits";
-import { verifyImagineAge } from "../grok/imagineWs";
+import { generateImagineViaWs, ImagineWsError, verifyImagineAge } from "../grok/imagineWs";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
 import {
@@ -96,6 +100,174 @@ async function clearKvCacheByType(
   return deleted;
 }
 
+const VALID_IMAGINE_ASPECT_RATIOS = new Set(["1:1", "2:3", "3:2", "9:16", "16:9"]);
+
+function normalizeImagineAspectRatio(v: unknown): "1:1" | "2:3" | "3:2" | "9:16" | "16:9" {
+  const ratio = String(v ?? "").trim();
+  if (VALID_IMAGINE_ASPECT_RATIOS.has(ratio)) {
+    return ratio as "1:1" | "2:3" | "3:2" | "9:16" | "16:9";
+  }
+  return "2:3";
+}
+
+function buildGrokCookie(jwt: string, cfCookie: string): string {
+  return cfCookie ? `sso-rw=${jwt};sso=${jwt};${cfCookie}` : `sso-rw=${jwt};sso=${jwt}`;
+}
+
+function toMessageText(data: unknown): string {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(data));
+  if (data instanceof Uint8Array) return new TextDecoder().decode(data);
+  return "";
+}
+
+function parseTokenTags(tagsJson: string): string[] {
+  try {
+    const v = JSON.parse(tagsJson) as unknown;
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type BatchTaskType = "refresh" | "nsfw" | "cache_load" | "cache_clear";
+
+interface BatchTaskState {
+  id: string;
+  type: BatchTaskType;
+  total: number;
+  processed: number;
+  cancelled: boolean;
+  done: boolean;
+  warning?: string;
+  error?: string;
+  result?: Record<string, unknown>;
+  createdAt: number;
+}
+
+const batchTasks = new Map<string, BatchTaskState>();
+const BATCH_TASK_TTL_MS = 30 * 60 * 1000;
+
+interface AutoRegisterJobState {
+  id: string;
+  pool: "ssoBasic" | "ssoSuper";
+  total: number;
+  concurrency: number;
+  status: "starting" | "running" | "stopping" | "stopped" | "completed" | "error";
+  completed: number;
+  added: number;
+  errors: number;
+  error: string | null;
+  last_error: string | null;
+  stopRequested: boolean;
+  logs: string[];
+  createdAt: number;
+  finishedAt: number | null;
+}
+
+const autoRegisterJobs = new Map<string, AutoRegisterJobState>();
+const AUTO_REGISTER_JOB_TTL_MS = 2 * 60 * 60 * 1000;
+
+function cleanupAutoRegisterJobs(): void {
+  const now = nowMs();
+  for (const [id, job] of autoRegisterJobs.entries()) {
+    if (now - job.createdAt > AUTO_REGISTER_JOB_TTL_MS) {
+      autoRegisterJobs.delete(id);
+    }
+  }
+}
+
+function appendAutoRegisterLog(job: AutoRegisterJobState, message: string): void {
+  const line = `[${new Date().toISOString()}] ${String(message || "").trim()}`;
+  if (!line.trim()) return;
+  job.logs.push(line);
+  if (job.logs.length > 200) job.logs.splice(0, job.logs.length - 200);
+}
+
+function serializeAutoRegisterJob(job: AutoRegisterJobState): Record<string, unknown> {
+  return {
+    job_id: job.id,
+    status: job.status,
+    pool: job.pool,
+    total: job.total,
+    concurrency: job.concurrency,
+    completed: job.completed,
+    added: job.added,
+    errors: job.errors,
+    error: job.error,
+    last_error: job.last_error,
+    started_at: job.createdAt,
+    finished_at: job.finishedAt,
+    logs: [...job.logs],
+  };
+}
+
+function getAutoRegisterJob(jobId?: string | null): AutoRegisterJobState | null {
+  cleanupAutoRegisterJobs();
+  if (jobId) return autoRegisterJobs.get(jobId) ?? null;
+  if (!autoRegisterJobs.size) return null;
+  let latest: AutoRegisterJobState | null = null;
+  for (const job of autoRegisterJobs.values()) {
+    if (!latest || job.createdAt > latest.createdAt) latest = job;
+  }
+  return latest;
+}
+
+function createAutoRegisterJob(args: {
+  pool: "ssoBasic" | "ssoSuper";
+  total: number;
+  concurrency: number;
+}): AutoRegisterJobState {
+  cleanupAutoRegisterJobs();
+  const job: AutoRegisterJobState = {
+    id: crypto.randomUUID().replace(/-/g, "").slice(0, 8),
+    pool: args.pool,
+    total: Math.max(1, Math.floor(args.total)),
+    concurrency: Math.max(1, Math.floor(args.concurrency)),
+    status: "starting",
+    completed: 0,
+    added: 0,
+    errors: 0,
+    error: null,
+    last_error: null,
+    stopRequested: false,
+    logs: [],
+    createdAt: nowMs(),
+    finishedAt: null,
+  };
+  appendAutoRegisterLog(job, `Auto-register job ${job.id} created (pool=${job.pool}, total=${job.total}, concurrency=${job.concurrency})`);
+  autoRegisterJobs.set(job.id, job);
+  return job;
+}
+
+function cleanupBatchTasks(): void {
+  const now = nowMs();
+  for (const [id, task] of batchTasks.entries()) {
+    if (now - task.createdAt > BATCH_TASK_TTL_MS) {
+      batchTasks.delete(id);
+    }
+  }
+}
+
+function createBatchTask(type: BatchTaskType, total: number): BatchTaskState {
+  cleanupBatchTasks();
+  const task: BatchTaskState = {
+    id: crypto.randomUUID(),
+    type,
+    total: Math.max(0, Math.floor(total)),
+    processed: 0,
+    cancelled: false,
+    done: false,
+    createdAt: nowMs(),
+  };
+  batchTasks.set(task.id, task);
+  return task;
+}
+
 export const adminRoutes = new Hono<{ Bindings: Env }>();
 
 // ============================================================================
@@ -150,12 +322,304 @@ async function getKvStats(db: Env["DB"]): Promise<{
   };
 }
 
+async function verifyAdminQueryApiKey(env: Env, apiKey: string): Promise<boolean> {
+  const token = String(apiKey || "").trim();
+  if (!token) return false;
+  return verifyAdminSession(env.DB, token);
+}
+
+function maskToken(raw: string): string {
+  const token = String(raw || "").trim();
+  if (!token) return "";
+  if (token.length <= 24) return token;
+  return `${token.slice(0, 8)}...${token.slice(-16)}`;
+}
+
+async function runAutoRegisterJob(job: AutoRegisterJobState): Promise<void> {
+  job.status = "running";
+  appendAutoRegisterLog(job, "Auto-register started.");
+
+  // Cloudflare Workers runtime cannot host the browser/solver workflow used by upstream auto-register.
+  await sleep(200);
+
+  if (job.stopRequested) {
+    job.status = "stopped";
+    job.finishedAt = nowMs();
+    appendAutoRegisterLog(job, "Auto-register stopped.");
+    return;
+  }
+
+  job.status = "error";
+  job.errors = Math.max(1, job.errors);
+  job.last_error = "Auto-register is not supported in Cloudflare Workers runtime.";
+  job.error = job.last_error;
+  job.finishedAt = nowMs();
+  appendAutoRegisterLog(job, job.last_error);
+}
+
+async function runCacheLoadBatchTask(env: Env, task: BatchTaskState, rawTokens: string[]): Promise<void> {
+  const rows = await listTokens(env.DB);
+  const accounts = rows.map((row) => ({
+    token: row.token,
+    token_masked: maskToken(row.token),
+    pool: toPoolName(row.token_type),
+    status: row.status,
+    last_asset_clear_at: null,
+  }));
+
+  const allKnown = new Set(rows.map((row) => row.token));
+  const requested = [...new Set(rawTokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+  const effectiveTokens = requested.length ? requested : rows.map((row) => row.token);
+
+  const details: Array<{
+    token: string;
+    token_masked: string;
+    count: number;
+    status: string;
+    last_asset_clear_at: number | null;
+  }> = [];
+
+  for (const token of effectiveTokens) {
+    if (task.cancelled) return;
+    const known = allKnown.has(token);
+    details.push({
+      token,
+      token_masked: maskToken(token),
+      count: 0,
+      status: known ? "not_loaded" : "not_found",
+      last_asset_clear_at: null,
+    });
+    task.processed += 1;
+    await sleep(20);
+  }
+
+  const stats = await getKvStats(env.DB);
+  task.warning =
+    "Online assets load is not supported on Cloudflare Workers; returned local cache stats and account metadata only.";
+  task.result = {
+    local_image: stats.image,
+    local_video: stats.video,
+    online: {
+      count: 0,
+      status: effectiveTokens.length ? "not_loaded" : "not_loaded",
+      token: effectiveTokens.length === 1 ? effectiveTokens[0] : null,
+      last_asset_clear_at: null,
+    },
+    online_accounts: accounts,
+    online_scope: requested.length ? "selected" : "all",
+    online_details: details,
+  };
+  task.done = true;
+}
+
+async function runCacheClearBatchTask(task: BatchTaskState, rawTokens: string[]): Promise<void> {
+  const requested = [...new Set(rawTokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+  const results: Record<string, { status: string; error?: string }> = {};
+  for (const token of requested) {
+    if (task.cancelled) return;
+    results[token] = {
+      status: "error",
+      error: "Online assets clear is not supported on Cloudflare Workers runtime.",
+    };
+    task.processed += 1;
+    await sleep(20);
+  }
+
+  task.warning = "Online assets clear is not supported on Cloudflare Workers.";
+  task.result = {
+    results,
+    summary: {
+      success: 0,
+      failed: requested.length,
+      total: requested.length,
+    },
+  };
+  task.done = true;
+}
+
+async function runRefreshBatchTask(
+  env: Env,
+  task: BatchTaskState,
+  tokens: string[],
+): Promise<void> {
+  const settings = await getSettings(env);
+  const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+  const syncAge = true;
+  const birthDate = ensureBirthDate(String(settings.grok.imagine_birth_date ?? ""));
+
+  const unique = [...new Set(tokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+  const placeholders = unique.map(() => "?").join(",");
+  const typeRows = placeholders
+    ? await dbAll<{ token: string; token_type: string }>(
+        env.DB,
+        `SELECT token, token_type FROM tokens WHERE token IN (${placeholders})`,
+        unique,
+      )
+    : [];
+  const tokenTypeByToken = new Map(typeRows.map((r) => [r.token, r.token_type]));
+
+  const results: Record<string, boolean> = {};
+
+  for (const t of unique) {
+    if (task.cancelled) return;
+
+    let refreshed = false;
+    let usageSynced = false;
+    try {
+      const cookie = buildGrokCookie(t, cf);
+      const tokenType = tokenTypeByToken.get(t) ?? "sso";
+      const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
+      const remaining = (r as any)?.remainingTokens;
+      let heavyRemaining: number | null = null;
+      if (tokenType === "ssoSuper") {
+        const rh = await checkRateLimits(cookie, settings.grok, "grok-4-heavy");
+        const hv = (rh as any)?.remainingTokens;
+        if (typeof hv === "number") heavyRemaining = hv;
+      }
+      if (typeof remaining === "number") {
+        await updateTokenLimits(env.DB, t, {
+          remaining_queries: remaining,
+          ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
+        });
+        await markTokenRecovered(env.DB, t);
+        usageSynced = true;
+        refreshed = true;
+      }
+
+      if (syncAge) {
+        let ageSynced = false;
+        try {
+          const ageOk = await verifyImagineAge({ cookie, birthDate, timeoutMs: 15_000 });
+          if (ageOk) {
+            await setTokenAgeVerified(env.DB, t, true);
+            ageSynced = true;
+            refreshed = true;
+          }
+        } catch {
+          // ignore age sync failures during refresh
+        }
+        if (!ageSynced && usageSynced) {
+          // Workers mode fallback: token is live even if age endpoint sync is unavailable.
+          await setTokenAgeVerified(env.DB, t, true);
+          refreshed = true;
+        }
+      }
+      results[`sso=${t}`] = refreshed;
+    } catch {
+      results[`sso=${t}`] = refreshed;
+    }
+
+    task.processed += 1;
+    await sleep(50);
+  }
+
+  const okCount = Object.values(results).filter(Boolean).length;
+  const failCount = Object.keys(results).length - okCount;
+  task.result = {
+    results,
+    summary: {
+      ok: okCount,
+      fail: failCount,
+      total: Object.keys(results).length,
+    },
+  };
+  task.done = true;
+}
+
+async function runNsfwBatchTask(
+  env: Env,
+  task: BatchTaskState,
+  tokens: string[],
+): Promise<void> {
+  const settings = await getSettings(env);
+  const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+  const birthDate = ensureBirthDate(String(settings.grok.imagine_birth_date ?? ""));
+
+  const rows = await listTokens(env.DB);
+  const byToken = new Map(rows.map((r) => [r.token, r]));
+
+  const unique = [...new Set(tokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+  const itemResults: Array<{ token: string; ok: boolean; message?: string }> = [];
+  let okCount = 0;
+  let failCount = 0;
+
+  for (const token of unique) {
+    if (task.cancelled) return;
+
+    const row = byToken.get(token);
+    if (!row) {
+      itemResults.push({ token: `sso=${token}`, ok: false, message: "Token not found" });
+      failCount += 1;
+      task.processed += 1;
+      continue;
+    }
+
+    let ok = false;
+    let message = "";
+    try {
+      const cookie = buildGrokCookie(token, cf);
+      const verified = await verifyImagineAge({ cookie, birthDate, timeoutMs: 20_000 });
+      if (!verified) {
+        message = "Age verify failed";
+      } else {
+        await setTokenAgeVerified(env.DB, token, true);
+        const tags = parseTokenTags(row.tags);
+        if (!tags.includes("nsfw")) tags.push("nsfw");
+        await updateTokenTags(env.DB, token, row.token_type, tags);
+        ok = true;
+      }
+    } catch (e) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+
+    if (ok) {
+      okCount += 1;
+      itemResults.push({ token: `sso=${token}`, ok: true });
+    } else {
+      failCount += 1;
+      itemResults.push({ token: `sso=${token}`, ok: false, ...(message ? { message } : {}) });
+    }
+    task.processed += 1;
+    await sleep(80);
+  }
+
+  task.result = {
+    summary: {
+      ok: okCount,
+      fail: failCount,
+      total: unique.length,
+    },
+    items: itemResults,
+  };
+  if (failCount > 0) {
+    task.warning = `NSFW enabling failed for ${failCount} token(s).`;
+  }
+  task.done = true;
+}
+
 adminRoutes.post("/api/v1/admin/login", async (c) => {
   try {
-    const body = (await c.req.json()) as { username?: string; password?: string };
+    let body: { username?: string; password?: string } = {};
+    const rawBody = await c.req.text();
+    if (rawBody.trim()) {
+      try {
+        body = JSON.parse(rawBody) as { username?: string; password?: string };
+      } catch {
+        body = {};
+      }
+    }
     const settings = await getSettings(c.env);
-    const username = String(body?.username ?? "").trim();
-    const password = String(body?.password ?? "").trim();
+    let username = String(body?.username ?? "").trim();
+    let password = String(body?.password ?? "").trim();
+
+    // Backward compatibility: allow password-only login via Bearer token.
+    if (!password) {
+      const bearer = parseBearer(c.req.header("Authorization") ?? null);
+      if (bearer) {
+        password = bearer;
+        if (!username) username = "admin";
+      }
+    }
 
     if (username !== settings.global.admin_username || password !== settings.global.admin_password) {
       return c.json(legacyErr("Invalid username or password"), 401);
@@ -166,6 +630,296 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
     return c.json(legacyOk({ api_key: token }));
   } catch (e) {
     return c.json(legacyErr(`Login error: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.get("/api/v1/admin/batch/:taskId/stream", async (c) => {
+  try {
+    const rawApiKey = String(c.req.query("api_key") ?? "").trim();
+    const ok = await verifyAdminQueryApiKey(c.env, rawApiKey);
+    if (!ok) return c.json(legacyErr("Unauthorized"), 401);
+
+    const taskId = c.req.param("taskId");
+    const task = batchTasks.get(taskId);
+    if (!task) return c.json(legacyErr("Task not found"), 404);
+
+    const encoder = new TextEncoder();
+    let timer: number | null = null;
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const send = (payload: Record<string, unknown>) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+        };
+
+        send({ type: "snapshot", total: task.total, processed: task.processed });
+
+        timer = setInterval(() => {
+          const t = batchTasks.get(taskId);
+          if (!t) {
+            send({ type: "error", error: "Task not found" });
+            if (timer !== null) clearInterval(timer);
+            controller.close();
+            return;
+          }
+
+          send({ type: "progress", total: t.total, processed: t.processed });
+
+          if (t.cancelled) {
+            send({ type: "cancelled", total: t.total, processed: t.processed });
+            if (timer !== null) clearInterval(timer);
+            controller.close();
+            return;
+          }
+
+          if (t.error) {
+            send({ type: "error", error: t.error, total: t.total, processed: t.processed });
+            if (timer !== null) clearInterval(timer);
+            controller.close();
+            return;
+          }
+
+          if (t.done) {
+            send({
+              type: "done",
+              total: t.total,
+              processed: t.processed,
+              ...(t.warning ? { warning: t.warning } : {}),
+              ...(t.result ? { result: t.result } : {}),
+            });
+            if (timer !== null) clearInterval(timer);
+            controller.close();
+            return;
+          }
+        }, 1000) as unknown as number;
+      },
+      cancel() {
+        if (timer !== null) clearInterval(timer);
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  } catch (e) {
+    return c.json(legacyErr(`Batch stream failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/batch/:taskId/cancel", requireAdminAuth, async (c) => {
+  const taskId = c.req.param("taskId");
+  const task = batchTasks.get(taskId);
+  if (!task) return c.json(legacyErr("Task not found"), 404);
+  task.cancelled = true;
+  return c.json(legacyOk({ task_id: taskId, cancelled: true }));
+});
+
+adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
+  try {
+    const rawApiKey = String(c.req.query("api_key") ?? "").trim();
+    const authed = await verifyAdminQueryApiKey(c.env, rawApiKey);
+    if (!authed) return c.text("Unauthorized", 401);
+
+    const upgrade = String(c.req.header("Upgrade") ?? "").toLowerCase();
+    if (upgrade !== "websocket") return c.text("Expected websocket", 426);
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    let closed = false;
+    let runSeq = 0;
+    let sequence = 0;
+    let currentRunId = "";
+
+    const send = (payload: Record<string, unknown>): boolean => {
+      if (closed) return false;
+      try {
+        server.send(JSON.stringify(payload));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const stopCurrent = (): void => {
+      runSeq += 1;
+    };
+
+    const startLoop = (prompt: string, aspectRatio: "1:1" | "2:3" | "3:2" | "9:16" | "16:9"): void => {
+      runSeq += 1;
+      const myRunSeq = runSeq;
+      const runId = crypto.randomUUID();
+      currentRunId = runId;
+
+      send({
+        type: "status",
+        status: "running",
+        prompt,
+        aspect_ratio: aspectRatio,
+        run_id: runId,
+      });
+
+      void (async () => {
+        while (!closed && myRunSeq === runSeq) {
+          const settings = await getSettings(c.env);
+          const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+          const birthDate = ensureBirthDate(String(settings.grok.imagine_birth_date ?? ""));
+          const autoAgeVerify = settings.grok.imagine_auto_age_verify !== false;
+          const enableNsfw = settings.grok.imagine_enable_nsfw !== false;
+
+          const chosen = await selectBestToken(c.env.DB, "grok-imagine-1.0");
+          if (!chosen) {
+            send({
+              type: "error",
+              message: "No available tokens. Please try again later.",
+              code: "rate_limit_exceeded",
+            });
+            await sleep(1500);
+            continue;
+          }
+
+          const jwt = chosen.token;
+          const cookie = buildGrokCookie(jwt, cf);
+          let calibratedAge = false;
+          if (autoAgeVerify) {
+            const verified = await getTokenAgeVerified(c.env.DB, jwt);
+            if (!verified) {
+              const ageOk = await verifyImagineAge({ cookie, birthDate, timeoutMs: 20_000 });
+              if (ageOk) {
+                await setTokenAgeVerified(c.env.DB, jwt, true);
+                calibratedAge = true;
+              }
+            } else {
+              calibratedAge = true;
+            }
+          }
+
+          try {
+            const startedAt = Date.now();
+            const generated = await generateImagineViaWs({
+              prompt,
+              aspectRatio,
+              n: 6,
+              cookie,
+              enableNsfw,
+            });
+            const elapsedMs = Date.now() - startedAt;
+
+            if (!calibratedAge) {
+              await setTokenAgeVerified(c.env.DB, jwt, true);
+            }
+
+            if (!generated.b64List.length) {
+              send({
+                type: "error",
+                message: "Image generation returned empty data.",
+                code: "empty_image",
+              });
+              await sleep(1000);
+              continue;
+            }
+
+            for (const b64 of generated.b64List) {
+              if (closed || myRunSeq !== runSeq) break;
+              sequence += 1;
+              if (!send({
+                type: "image",
+                b64_json: b64,
+                sequence,
+                created_at: nowMs(),
+                elapsed_ms: elapsedMs,
+                aspect_ratio: aspectRatio,
+                run_id: runId,
+              })) {
+                break;
+              }
+            }
+          } catch (e) {
+            const status =
+              e instanceof ImagineWsError && typeof e.status === "number"
+                ? e.status
+                : 500;
+            const message = e instanceof Error ? e.message : String(e);
+            await recordTokenFailure(c.env.DB, jwt, status, message.slice(0, 200));
+            await applyCooldown(c.env.DB, jwt, status);
+            send({
+              type: "error",
+              message,
+              code: e instanceof ImagineWsError ? e.code : "internal_error",
+            });
+            await sleep(1500);
+          }
+        }
+
+        if (!closed && myRunSeq === runSeq) {
+          send({ type: "status", status: "stopped", run_id: currentRunId || runId });
+        }
+      })();
+    };
+
+    server.accept();
+    server.addEventListener("message", (evt) => {
+      const raw = toMessageText((evt as MessageEvent).data);
+      if (!raw) return;
+
+      let payload: any = null;
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        send({ type: "error", message: "Invalid message format.", code: "invalid_payload" });
+        return;
+      }
+
+      const msgType = String(payload?.type ?? "");
+      if (msgType === "ping") {
+        send({ type: "pong" });
+        return;
+      }
+
+      if (msgType === "stop") {
+        stopCurrent();
+        send({ type: "status", status: "stopped", run_id: currentRunId });
+        return;
+      }
+
+      if (msgType !== "start") {
+        send({ type: "error", message: "Unknown command.", code: "unknown_command" });
+        return;
+      }
+
+      const prompt = String(payload?.prompt ?? "").trim();
+      if (!prompt) {
+        send({ type: "error", message: "Prompt cannot be empty.", code: "empty_prompt" });
+        return;
+      }
+
+      const ratio = normalizeImagineAspectRatio(payload?.aspect_ratio);
+      stopCurrent();
+      startLoop(prompt, ratio);
+    });
+
+    const closeHandler = () => {
+      closed = true;
+      stopCurrent();
+      try {
+        server.close(1000, "closed");
+      } catch {
+        // ignore
+      }
+    };
+
+    server.addEventListener("close", closeHandler);
+    server.addEventListener("error", closeHandler);
+
+    return new Response(null, { status: 101, webSocket: client });
+  } catch (e) {
+    return c.text(`WebSocket init error: ${e instanceof Error ? e.message : String(e)}`, 500);
   }
 });
 
@@ -455,6 +1209,7 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     const results: Record<string, boolean> = {};
     for (const t of unique) {
       let refreshed = false;
+      let usageSynced = false;
       try {
         const cookie = cf ? `sso-rw=${t};sso=${t};${cf}` : `sso-rw=${t};sso=${t}`;
         const tokenType = tokenTypeByToken.get(t) ?? "sso";
@@ -472,18 +1227,26 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
             ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
           });
           await markTokenRecovered(c.env.DB, t);
+          usageSynced = true;
           refreshed = true;
         }
 
         if (syncAge) {
+          let ageSynced = false;
           try {
             const ageOk = await verifyImagineAge({ cookie, birthDate, timeoutMs: 15_000 });
             if (ageOk) {
               await setTokenAgeVerified(c.env.DB, t, true);
+              ageSynced = true;
               refreshed = true;
             }
           } catch {
             // ignore age sync failures during refresh
+          }
+          if (!ageSynced && usageSynced) {
+            // Workers mode fallback: token is live even if age endpoint sync is unavailable.
+            await setTokenAgeVerified(c.env.DB, t, true);
+            refreshed = true;
           }
         }
         results[`sso=${t}`] = refreshed;
@@ -499,6 +1262,177 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
   }
 });
 
+adminRoutes.post("/api/v1/admin/tokens/refresh/async", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const tokens: string[] = [];
+    if (body && typeof body === "object") {
+      if (typeof body.token === "string") tokens.push(body.token);
+      if (Array.isArray(body.tokens)) tokens.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+
+    const unique = [...new Set(tokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!unique.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const task = createBatchTask("refresh", unique.length);
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          await runRefreshBatchTask(c.env, task, unique);
+        } catch (e) {
+          task.error = e instanceof Error ? e.message : String(e);
+        }
+      })(),
+    );
+
+    return c.json(legacyOk({ task_id: task.id }));
+  } catch (e) {
+    return c.json(legacyErr(`Async refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/nsfw/enable/async", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const inputTokens: string[] = Array.isArray(body?.tokens)
+      ? (body.tokens as unknown[]).filter((x): x is string => typeof x === "string")
+      : [];
+    const unique: string[] = [...new Set(inputTokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!unique.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const task = createBatchTask("nsfw", unique.length);
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          await runNsfwBatchTask(c.env, task, unique);
+        } catch (e) {
+          task.error = e instanceof Error ? e.message : String(e);
+        }
+      })(),
+    );
+
+    return c.json(legacyOk({ task_id: task.id }));
+  } catch (e) {
+    return c.json(legacyErr(`NSFW async failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/auto-register", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const poolRaw = String(body?.pool ?? "ssoBasic").trim();
+    const pool: "ssoBasic" | "ssoSuper" = poolRaw === "ssoSuper" ? "ssoSuper" : "ssoBasic";
+    const countRaw = Number(body?.count ?? 100);
+    const concurrencyRaw = Number(body?.concurrency ?? 10);
+    const total = Number.isFinite(countRaw) && countRaw > 0 ? Math.floor(countRaw) : 100;
+    const concurrency = Number.isFinite(concurrencyRaw) && concurrencyRaw > 0 ? Math.floor(concurrencyRaw) : 10;
+
+    for (const job of autoRegisterJobs.values()) {
+      if (job.status === "starting" || job.status === "running" || job.status === "stopping") {
+        return c.json({ detail: "Auto registration already running" }, 409);
+      }
+    }
+
+    const job = createAutoRegisterJob({ pool, total, concurrency });
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          await runAutoRegisterJob(job);
+        } catch (e) {
+          job.status = "error";
+          job.errors += 1;
+          job.last_error = e instanceof Error ? e.message : String(e);
+          job.error = job.last_error;
+          job.finishedAt = nowMs();
+          appendAutoRegisterLog(job, `Auto-register failed: ${job.last_error}`);
+        }
+      })(),
+    );
+
+    return c.json({
+      status: "started",
+      job: serializeAutoRegisterJob(job),
+    });
+  } catch (e) {
+    return c.json({ detail: e instanceof Error ? e.message : String(e) }, 500);
+  }
+});
+
+adminRoutes.get("/api/v1/admin/tokens/auto-register/status", requireAdminAuth, async (c) => {
+  const jobId = String(c.req.query("job_id") ?? "").trim();
+  const job = getAutoRegisterJob(jobId || null);
+  if (!job) {
+    if (jobId) return c.json({ status: "not_found" }, 404);
+    return c.json({ status: "idle", logs: [] });
+  }
+  return c.json(serializeAutoRegisterJob(job));
+});
+
+adminRoutes.post("/api/v1/admin/tokens/auto-register/stop", requireAdminAuth, async (c) => {
+  const jobId = String(c.req.query("job_id") ?? "").trim();
+  const job = getAutoRegisterJob(jobId || null);
+  if (!job) return c.json({ status: "not_found" }, 404);
+
+  if (job.status === "completed" || job.status === "stopped" || job.status === "error") {
+    return c.json(serializeAutoRegisterJob(job));
+  }
+
+  job.stopRequested = true;
+  if (job.status === "starting" || job.status === "running") {
+    job.status = "stopping";
+    appendAutoRegisterLog(job, "Stop requested.");
+  }
+  return c.json({ status: "stopping", job_id: job.id });
+});
+
+adminRoutes.post("/api/v1/admin/cache/online/load/async", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const rawTokens = Array.isArray(body?.tokens)
+      ? (body.tokens as unknown[]).filter((x): x is string => typeof x === "string")
+      : [];
+    const tokens = [...new Set(rawTokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    const task = createBatchTask("cache_load", tokens.length);
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          await runCacheLoadBatchTask(c.env, task, tokens);
+        } catch (e) {
+          task.error = e instanceof Error ? e.message : String(e);
+        }
+      })(),
+    );
+    return c.json(legacyOk({ task_id: task.id }));
+  } catch (e) {
+    return c.json(legacyErr(`Cache load async failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/cache/online/clear/async", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const rawTokens = Array.isArray(body?.tokens)
+      ? (body.tokens as unknown[]).filter((x): x is string => typeof x === "string")
+      : [];
+    const tokens = [...new Set(rawTokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!tokens.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const task = createBatchTask("cache_clear", tokens.length);
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          await runCacheClearBatchTask(task, tokens);
+        } catch (e) {
+          task.error = e instanceof Error ? e.message : String(e);
+        }
+      })(),
+    );
+    return c.json(legacyOk({ task_id: task.id }));
+  } catch (e) {
+    return c.json(legacyErr(`Cache clear async failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
 adminRoutes.get("/api/v1/admin/cache/local", requireAdminAuth, async (c) => {
   try {
     const stats = await getKvStats(c.env.DB);
@@ -511,12 +1445,20 @@ adminRoutes.get("/api/v1/admin/cache/local", requireAdminAuth, async (c) => {
 adminRoutes.get("/api/v1/admin/cache", requireAdminAuth, async (c) => {
   try {
     const stats = await getKvStats(c.env.DB);
+    const rows = await listTokens(c.env.DB);
+    const accounts = rows.map((row) => ({
+      token: row.token,
+      token_masked: maskToken(row.token),
+      pool: toPoolName(row.token_type),
+      status: row.status,
+      last_asset_clear_at: null,
+    }));
     return c.json({
       local_image: stats.image,
       local_video: stats.video,
       online: { count: 0, status: "not_loaded", token: null, last_asset_clear_at: null },
-      online_accounts: [],
-      online_scope: "none",
+      online_accounts: accounts,
+      online_scope: "all",
       online_details: [],
     });
   } catch (e) {
@@ -579,6 +1521,16 @@ adminRoutes.post("/api/v1/admin/cache/item/delete", requireAdminAuth, async (c) 
 
 adminRoutes.post("/api/v1/admin/cache/online/clear", requireAdminAuth, async (c) => {
   return c.json(legacyErr("Online assets clear is not supported on Cloudflare Workers"), 501);
+});
+
+adminRoutes.get("/api/v1/admin/voice/token", requireAdminAuth, async (c) => {
+  return c.json(
+    {
+      detail:
+        "Voice real-time token issuing is not supported on Cloudflare Workers runtime. Please use the Python backend for voice.",
+    },
+    501,
+  );
 });
 
 adminRoutes.get("/api/v1/admin/metrics", requireAdminAuth, async (c) => {

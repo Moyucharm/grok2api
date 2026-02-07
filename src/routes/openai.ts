@@ -130,6 +130,18 @@ function normalizeImageResponseFormat(v: unknown): ImageResponseFormat | null {
   return null;
 }
 
+function normalizeImageEditResponseFormat(v: unknown): ImageResponseFormat | null {
+  const format = String(v ?? "url").trim().toLowerCase();
+  if (format === "base64") return "b64_json";
+  return normalizeImageResponseFormat(format);
+}
+
+function parseBooleanLike(v: unknown, fallback = false): boolean {
+  const raw = String(v ?? "").trim().toLowerCase();
+  if (!raw) return fallback;
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 function mapSizeToAspectRatio(sizeRaw: unknown): string | null {
   const size = String(sizeRaw ?? "").trim().toLowerCase();
   if (!size) return null;
@@ -193,6 +205,12 @@ function arrayBufferToBase64(buf: ArrayBuffer): string {
     out += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
   return btoa(out);
+}
+
+async function fileToDataUrl(file: File): Promise<string> {
+  const mime = String(file.type || "image/jpeg").trim().toLowerCase() || "image/jpeg";
+  const bytes = await file.arrayBuffer();
+  return `data:${mime};base64,${arrayBufferToBase64(bytes)}`;
 }
 
 async function fetchProxyImageAsBase64(origin: string, encodedPath: string): Promise<string> {
@@ -1125,7 +1143,7 @@ openAiRoutes.post("/images/generations", async (c) => {
   const keyName = c.get("apiAuth").name ?? "Unknown";
   const origin = new URL(c.req.url).origin;
 
-  let requestedModel = "grok-imagine";
+  let requestedModel = "grok-imagine-1.0";
   try {
     const body = (await c.req.json()) as {
       prompt?: string;
@@ -1145,7 +1163,7 @@ openAiRoutes.post("/images/generations", async (c) => {
       return c.json(openAiError("Invalid 'response_format', expected 'url' or 'b64_json'", "invalid_response_format"), 400);
     const warning = hasResolutionDowngradeWarning(body.image_config);
 
-    requestedModel = String(body.model ?? "grok-imagine").trim() || "grok-imagine";
+    requestedModel = String(body.model ?? "grok-imagine-1.0").trim() || "grok-imagine-1.0";
     if (!isValidModel(requestedModel))
       return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
     const cfg = MODEL_CONFIG[requestedModel]!;
@@ -1314,6 +1332,200 @@ openAiRoutes.post("/images/generations", async (c) => {
       error: e instanceof Error ? e.message : String(e),
     });
     return c.json(openAiError(e instanceof Error ? e.message : "Internal error", "internal_error"), 500);
+  }
+});
+
+openAiRoutes.post("/images/edits", async (c) => {
+  const start = Date.now();
+  const ip = getClientIp(c.req.raw);
+  const keyName = c.get("apiAuth").name ?? "Unknown";
+  const origin = new URL(c.req.url).origin;
+
+  let requestedModel = "grok-imagine-1.0-edit";
+  try {
+    const form = await c.req.formData();
+    const prompt = String(form.get("prompt") ?? "").trim();
+    if (!prompt) return c.json(openAiError("Missing 'prompt'", "missing_prompt"), 400);
+
+    requestedModel = String(form.get("model") ?? "grok-imagine-1.0-edit").trim() || "grok-imagine-1.0-edit";
+    if (!isValidModel(requestedModel))
+      return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+    if (requestedModel !== "grok-imagine-1.0-edit")
+      return c.json(openAiError("The model `grok-imagine-1.0-edit` is required for image edits.", "invalid_model"), 400);
+
+    const responseFormat = normalizeImageEditResponseFormat(form.get("response_format"));
+    if (!responseFormat)
+      return c.json(openAiError("Invalid 'response_format', expected 'url' or 'b64_json'", "invalid_response_format"), 400);
+
+    const stream = parseBooleanLike(form.get("stream"), false);
+    if (stream)
+      return c.json(openAiError("Streaming image edits are not supported on Cloudflare Workers", "unsupported_stream"), 400);
+
+    const nRaw = Number(form.get("n") ?? 1);
+    const n = Number.isFinite(nRaw) ? Math.max(1, Math.min(10, Math.floor(nRaw))) : 1;
+
+    const files = form.getAll("image").filter((item): item is File => item instanceof File);
+    if (!files.length) return c.json(openAiError("Missing 'image' file", "missing_image"), 400);
+
+    const maxImageBytes = 50 * 1024 * 1024;
+    const allowedTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/jpg"]);
+    for (const file of files) {
+      const mime = String(file.type || "").trim().toLowerCase();
+      if (!allowedTypes.has(mime)) {
+        return c.json(openAiError("Unsupported image type. Supported: png, jpg, webp.", "invalid_image_type"), 400);
+      }
+      if (Number(file.size ?? 0) > maxImageBytes) {
+        return c.json(openAiError("Image file too large. Maximum is 50MB.", "file_too_large"), 413);
+      }
+    }
+
+    const imageDataUrls = await Promise.all(files.map((file) => fileToDataUrl(file)));
+
+    const quota = await enforceQuota({
+      env: c.env,
+      apiAuth: c.get("apiAuth"),
+      model: requestedModel,
+      kind: "image",
+      imageCount: n,
+    });
+    if (!quota.ok) return quota.resp;
+
+    const settingsBundle = await getSettings(c.env);
+    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+    const baseUrl = (settingsBundle.global.base_url ?? "").trim() || origin;
+
+    const modelName = MODEL_CONFIG[requestedModel]?.grok_model?.[0] ?? "imagine-image-edit";
+    const modelMode = MODEL_CONFIG[requestedModel]?.grok_model?.[1] ?? "MODEL_MODE_FAST";
+    const calls = Math.ceil(n / 2);
+
+    const doOne = async (): Promise<{ urls: string[]; tokenSuffix: string }> => {
+      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      if (!chosen) throw new Error("No available token");
+      const cookie = cf ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}` : `sso-rw=${chosen.token};sso=${chosen.token}`;
+
+      const uploads = await mapLimit(imageDataUrls, 2, async (imageDataUrl) =>
+        uploadImage(imageDataUrl, cookie, settingsBundle.grok),
+      );
+
+      const uploadUris = uploads
+        .map((u) => String(u.fileUri ?? "").trim())
+        .filter(Boolean);
+      if (!uploadUris.length) throw new Error("Image upload failed");
+
+      const imageReferences = uploadUris.map((uri) => {
+        if (/^https?:\/\//i.test(uri)) return uri;
+        return uri.startsWith("/") ? `https://assets.grok.com${uri}` : `https://assets.grok.com/${uri}`;
+      });
+
+      let parentPostId: string | undefined;
+      try {
+        const firstUri = uploadUris[0]!;
+        const post = await createPost(firstUri, cookie, settingsBundle.grok);
+        if (post.postId) parentPostId = post.postId;
+      } catch {
+        // Continue without parent post id.
+      }
+
+      const payload: Record<string, unknown> = {
+        temporary: Boolean(settingsBundle.grok.temporary ?? true),
+        modelName,
+        message: prompt,
+        enableImageGeneration: true,
+        returnImageBytes: false,
+        returnRawGrokInXaiRequest: false,
+        enableImageStreaming: true,
+        imageGenerationCount: 2,
+        forceConcise: false,
+        toolOverrides: { imageGen: true },
+        enableSideBySide: true,
+        sendFinalMetadata: true,
+        isReasoning: false,
+        disableTextFollowUps: true,
+        responseMetadata: {
+          modelConfigOverride: {
+            modelMap: {
+              imageEditModel: "imagine",
+              imageEditModelConfig: {
+                imageReferences,
+                ...(parentPostId ? { parentPostId } : {}),
+              },
+            },
+          },
+        },
+        disableMemory: false,
+        forceSideBySide: false,
+        modelMode,
+        isAsyncChat: false,
+      };
+
+      const upstream = await sendConversationRequest({
+        payload,
+        cookie,
+        settings: settingsBundle.grok,
+      });
+      if (!upstream.ok) {
+        const txt = await upstream.text().catch(() => "");
+        await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
+        await applyCooldown(c.env.DB, chosen.token, upstream.status);
+        throw new Error(`Upstream ${upstream.status}: ${txt.slice(0, 200)}`);
+      }
+
+      return {
+        urls: await collectGeneratedImageUrls(upstream),
+        tokenSuffix: chosen.token.slice(-6),
+      };
+    };
+
+    const rawNested = await mapLimit(
+      Array.from({ length: calls }).map((_, i) => i),
+      2,
+      async () => doOne(),
+    );
+    const rawUrls = rawNested
+      .flatMap((item) => item.urls)
+      .filter(Boolean)
+      .slice(0, n);
+    if (!rawUrls.length) throw new Error("No image URL returned from edit pipeline");
+
+    const encoded = rawUrls.map((u) => encodeAssetPath(u));
+    scheduleImagePrefetch(c, origin, encoded);
+
+    let data: Array<{ url?: string; b64_json?: string }> = [];
+    if (responseFormat === "url") {
+      data = encoded.map((path) => ({ url: toProxyUrl(baseUrl, path) }));
+    } else {
+      const b64 = await mapLimit(encoded, 2, async (path) => fetchProxyImageAsBase64(origin, path));
+      data = b64.map((b64_json) => ({ b64_json }));
+    }
+
+    const duration = (Date.now() - start) / 1000;
+    await addRequestLog(c.env.DB, {
+      ip,
+      model: requestedModel,
+      duration: Number(duration.toFixed(2)),
+      status: 200,
+      key_name: keyName,
+      token_suffix: rawNested.find((item) => item.tokenSuffix)?.tokenSuffix ?? "",
+      error: "",
+    });
+
+    return c.json({
+      created: Math.floor(Date.now() / 1000),
+      data,
+    });
+  } catch (e) {
+    const duration = (Date.now() - start) / 1000;
+    const message = e instanceof Error ? e.message : String(e);
+    await addRequestLog(c.env.DB, {
+      ip,
+      model: requestedModel || "grok-imagine-1.0-edit",
+      duration: Number(duration.toFixed(2)),
+      status: 500,
+      key_name: keyName,
+      token_suffix: "",
+      error: message,
+    });
+    return c.json(openAiError(message, "internal_error"), 500);
   }
 });
 
