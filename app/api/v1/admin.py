@@ -1,19 +1,27 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, Optional
 
 from app.core.auth import verify_api_key
 from app.core.config import config, get_config
 from app.core.storage import get_storage, LocalStorage, RedisStorage, SQLStorage
 import os
+import time
+import uuid
 from pathlib import Path
 import aiofiles
 import asyncio
 import json
+import orjson
 from app.core.logger import logger
 from app.services.register import get_auto_register_manager
 from app.services.api_keys import api_key_manager
+from app.api.v1.image import resolve_aspect_ratio
+from app.services.grok.services.image import image_service
+from app.services.grok.models.model import ModelService
+from app.services.grok.processors.image_ws_processors import ImageWSCollectProcessor
+from app.services.token import EffortType
 
 
 router = APIRouter()
@@ -26,7 +34,7 @@ class AdminLoginBody(BaseModel):
     password: str | None = None
 
 async def render_template(filename: str):
-    """渲染指定模板"""
+    """娓叉煋鎸囧畾妯℃澘"""
     template_path = TEMPLATE_DIR / filename
     if not template_path.exists():
         return HTMLResponse(f"Template {filename} not found.", status_code=404)
@@ -54,40 +62,265 @@ async def admin_login_page():
 
 @router.get("/admin/config", response_class=HTMLResponse, include_in_schema=False)
 async def admin_config_page():
-    """配置管理页"""
+    """閰嶇疆绠＄悊椤"""
     return await render_template("config/config.html")
 
 @router.get("/admin/token", response_class=HTMLResponse, include_in_schema=False)
 async def admin_token_page():
-    """Token 管理页"""
+    """Token 绠＄悊椤"""
     return await render_template("token/token.html")
 
 @router.get("/admin/datacenter", response_class=HTMLResponse, include_in_schema=False)
 async def admin_datacenter_page():
-    """数据中心页"""
+    """鏁版嵁涓績椤"""
     return await render_template("datacenter/datacenter.html")
 
 @router.get("/admin/keys", response_class=HTMLResponse, include_in_schema=False)
 async def admin_keys_page():
-    """API Key 管理页"""
+    """API Key 绠＄悊椤"""
     return await render_template("keys/keys.html")
 
 @router.get("/chat", response_class=HTMLResponse, include_in_schema=False)
 async def chat_page():
-    """在线聊天页（公开入口）"""
+    """鍦ㄧ嚎鑱婂ぉ椤碉紙鍏紑鍏ュ彛锛"""
     return await render_template("chat/chat.html")
 
 @router.get("/admin/chat", response_class=HTMLResponse, include_in_schema=False)
 async def admin_chat_page():
-    """在线聊天页（后台入口）"""
+    """鍦ㄧ嚎鑱婂ぉ椤碉紙鍚庡彴鍏ュ彛锛"""
     return await render_template("chat/chat_admin.html")
+
+
+@router.get("/admin/imagine", response_class=HTMLResponse, include_in_schema=False)
+async def admin_imagine_page():
+    """Imagine 鍥剧墖鐎戝竷娴"""
+    return await render_template("imagine/imagine.html")
+
+
+def _verify_ws_api_key(websocket: WebSocket) -> bool:
+    api_key = str(get_config("app.api_key", "") or "").strip()
+    if not api_key:
+        return True
+    key = websocket.query_params.get("api_key")
+    return key == api_key
+
+
+@router.websocket("/api/v1/admin/imagine/ws")
+async def admin_imagine_ws(websocket: WebSocket):
+    if not _verify_ws_api_key(websocket):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    stop_event = asyncio.Event()
+    run_task: Optional[asyncio.Task] = None
+
+    async def _send(payload: dict) -> bool:
+        try:
+            await websocket.send_text(orjson.dumps(payload).decode())
+            return True
+        except Exception:
+            return False
+
+    async def _stop_run():
+        nonlocal run_task
+        stop_event.set()
+        if run_task and not run_task.done():
+            run_task.cancel()
+            try:
+                await run_task
+            except Exception:
+                pass
+        run_task = None
+        stop_event.clear()
+
+    async def _run(prompt: str, aspect_ratio: str):
+        model_id = "grok-imagine-1.0"
+        model_info = ModelService.get(model_id)
+        if not model_info or not model_info.is_image:
+            await _send(
+                {
+                    "type": "error",
+                    "message": "Image model is not available.",
+                    "code": "model_not_supported",
+                }
+            )
+            return
+
+        from app.services.token.manager import get_token_manager
+
+        token_mgr = await get_token_manager()
+        enable_nsfw = bool(get_config("image.image_ws_nsfw", True))
+        sequence = 0
+        run_id = uuid.uuid4().hex
+
+        await _send(
+            {
+                "type": "status",
+                "status": "running",
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "run_id": run_id,
+            }
+        )
+
+        while not stop_event.is_set():
+            try:
+                await token_mgr.reload_if_stale()
+                token = None
+                for pool_name in ModelService.pool_candidates_for_model(
+                    model_info.model_id
+                ):
+                    token = token_mgr.get_token(pool_name)
+                    if token:
+                        break
+
+                if not token:
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": "No available tokens. Please try again later.",
+                            "code": "rate_limit_exceeded",
+                        }
+                    )
+                    await asyncio.sleep(2)
+                    continue
+
+                upstream = image_service.stream(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    n=6,
+                    enable_nsfw=enable_nsfw,
+                )
+
+                processor = ImageWSCollectProcessor(
+                    model_info.model_id,
+                    token,
+                    n=6,
+                    response_format="b64_json",
+                )
+
+                start_at = time.time()
+                images = await processor.process(upstream)
+                elapsed_ms = int((time.time() - start_at) * 1000)
+
+                if images and all(img and img != "error" for img in images):
+                    for img_b64 in images:
+                        sequence += 1
+                        await _send(
+                            {
+                                "type": "image",
+                                "b64_json": img_b64,
+                                "sequence": sequence,
+                                "created_at": int(time.time() * 1000),
+                                "elapsed_ms": elapsed_ms,
+                                "aspect_ratio": aspect_ratio,
+                                "run_id": run_id,
+                            }
+                        )
+
+                    try:
+                        effort = (
+                            EffortType.HIGH
+                            if (model_info and model_info.cost.value == "high")
+                            else EffortType.LOW
+                        )
+                        await token_mgr.consume(token, effort)
+                    except Exception as e:
+                        logger.warning(f"Failed to consume token: {e}")
+                else:
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": "Image generation returned empty data.",
+                            "code": "empty_image",
+                        }
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Imagine stream error: {e}")
+                await _send(
+                    {
+                        "type": "error",
+                        "message": str(e),
+                        "code": "internal_error",
+                    }
+                )
+                await asyncio.sleep(1.5)
+
+        await _send({"type": "status", "status": "stopped", "run_id": run_id})
+
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except (RuntimeError, WebSocketDisconnect):
+                break
+
+            try:
+                payload = orjson.loads(raw)
+            except Exception:
+                await _send(
+                    {
+                        "type": "error",
+                        "message": "Invalid message format.",
+                        "code": "invalid_payload",
+                    }
+                )
+                continue
+
+            msg_type = payload.get("type")
+            if msg_type == "start":
+                prompt = str(payload.get("prompt") or "").strip()
+                if not prompt:
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": "Prompt cannot be empty.",
+                            "code": "empty_prompt",
+                        }
+                    )
+                    continue
+                ratio = str(payload.get("aspect_ratio") or "2:3").strip() or "2:3"
+                ratio = resolve_aspect_ratio(ratio)
+                await _stop_run()
+                stop_event.clear()
+                run_task = asyncio.create_task(_run(prompt, ratio))
+            elif msg_type == "stop":
+                await _stop_run()
+            elif msg_type == "ping":
+                await _send({"type": "pong"})
+            else:
+                await _send(
+                    {
+                        "type": "error",
+                        "message": "Unknown command.",
+                        "code": "unknown_command",
+                    }
+                )
+    except WebSocketDisconnect:
+        logger.debug("WebSocket disconnected by client")
+    except Exception as e:
+        logger.warning(f"WebSocket error: {e}")
+    finally:
+        await _stop_run()
+        try:
+            from starlette.websockets import WebSocketState
+
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close(code=1000, reason="Server closing connection")
+        except Exception as e:
+            logger.debug(f"WebSocket close ignored: {e}")
 
 @router.post("/api/v1/admin/login")
 async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(default=None)):
-    """管理后台登录验证（用户名+密码）
+    """绠＄悊鍚庡彴鐧诲綍楠岃瘉锛堢敤鎴峰悕+瀵嗙爜锛?
 
-    - 默认账号/密码：admin/admin（可在配置管理的「应用设置」里修改）
-    - 兼容旧版本：允许 Authorization: Bearer <password> 仅密码登录（用户名默认为 admin）
+    - 榛樿璐﹀彿/瀵嗙爜锛歛dmin/admin锛堝彲鍦ㄩ厤缃鐞嗙殑銆屽簲鐢ㄨ缃€嶉噷淇敼锛?
+    - 鍏煎鏃х増鏈細鍏佽 Authorization: Bearer <password> 浠呭瘑鐮佺櫥褰曪紙鐢ㄦ埛鍚嶉粯璁や负 admin锛?
     """
 
     admin_username = str(get_config("app.admin_username", "admin") or "admin").strip() or "admin"
@@ -114,13 +347,13 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
 
 @router.get("/api/v1/admin/config", dependencies=[Depends(verify_api_key)])
 async def get_config_api():
-    """获取当前配置"""
-    # 暴露原始配置字典
+    """鑾峰彇褰撳墠閰嶇疆"""
+    # 鏆撮湶鍘熷閰嶇疆瀛楀吀
     return config._config
 
 @router.post("/api/v1/admin/config", dependencies=[Depends(verify_api_key)])
 async def update_config_api(data: dict):
-    """更新配置"""
+    """鏇存柊閰嶇疆"""
     try:
         await config.update(data)
         return {"status": "success", "message": "配置已更新"}
@@ -266,7 +499,7 @@ async def delete_api_key(data: dict):
 
 @router.get("/api/v1/admin/storage", dependencies=[Depends(verify_api_key)])
 async def get_storage_info():
-    """获取当前存储模式"""
+    """鑾峰彇褰撳墠瀛樺偍妯″紡"""
     storage_type = os.getenv("SERVER_STORAGE_TYPE", "local").lower()
     logger.info(f"Storage type: {storage_type}")
     if not storage_type:
@@ -288,14 +521,14 @@ async def get_storage_info():
 
 @router.get("/api/v1/admin/tokens", dependencies=[Depends(verify_api_key)])
 async def get_tokens_api():
-    """获取所有 Token"""
+    """鑾峰彇鎵€鏈?Token"""
     storage = get_storage()
     tokens = await storage.load_tokens()
     return tokens or {}
 
 @router.post("/api/v1/admin/tokens", dependencies=[Depends(verify_api_key)])
 async def update_tokens_api(data: dict):
-    """更新 Token 信息"""
+    """鏇存柊 Token 淇℃伅"""
     storage = get_storage()
     try:
         from app.services.token.manager import get_token_manager
@@ -309,7 +542,7 @@ async def update_tokens_api(data: dict):
 
 @router.post("/api/v1/admin/tokens/refresh", dependencies=[Depends(verify_api_key)])
 async def refresh_tokens_api(data: dict):
-    """刷新 Token 状态"""
+    """鍒锋柊 Token 鐘舵€"""
     from app.services.token.manager import get_token_manager
     
     try:
@@ -394,13 +627,13 @@ async def auto_register_stop_api(job_id: str | None = None):
 
 @router.get("/admin/cache", response_class=HTMLResponse, include_in_schema=False)
 async def admin_cache_page():
-    """缓存管理页"""
+    """缂撳瓨绠＄悊椤"""
     return await render_template("cache/cache.html")
 
 @router.get("/api/v1/admin/cache", dependencies=[Depends(verify_api_key)])
 async def get_cache_stats_api(request: Request):
-    """获取缓存统计"""
-    from app.services.grok.assets import DownloadService, ListService
+    """鑾峰彇缂撳瓨缁熻"""
+    from app.services.grok.services.assets import DownloadService, ListService
     from app.services.token.manager import get_token_manager
     
     try:
@@ -525,8 +758,8 @@ async def get_cache_stats_api(request: Request):
 
 @router.post("/api/v1/admin/cache/clear", dependencies=[Depends(verify_api_key)])
 async def clear_local_cache_api(data: dict):
-    """清理本地缓存"""
-    from app.services.grok.assets import DownloadService
+    """娓呯悊鏈湴缂撳瓨"""
+    from app.services.grok.services.assets import DownloadService
     cache_type = data.get("type", "image")
     
     try:
@@ -543,8 +776,8 @@ async def list_local_cache_api(
     page: int = 1,
     page_size: int = 1000
 ):
-    """列出本地缓存文件"""
-    from app.services.grok.assets import DownloadService
+    """鍒楀嚭鏈湴缂撳瓨鏂囦欢"""
+    from app.services.grok.services.assets import DownloadService
     try:
         if type_:
             cache_type = type_
@@ -556,8 +789,8 @@ async def list_local_cache_api(
 
 @router.post("/api/v1/admin/cache/item/delete", dependencies=[Depends(verify_api_key)])
 async def delete_local_cache_item_api(data: dict):
-    """删除单个本地缓存文件"""
-    from app.services.grok.assets import DownloadService
+    """鍒犻櫎鍗曚釜鏈湴缂撳瓨鏂囦欢"""
+    from app.services.grok.services.assets import DownloadService
     cache_type = data.get("type", "image")
     name = data.get("name")
     if not name:
@@ -571,8 +804,8 @@ async def delete_local_cache_item_api(data: dict):
 
 @router.post("/api/v1/admin/cache/online/clear", dependencies=[Depends(verify_api_key)])
 async def clear_online_cache_api(data: dict):
-    """清理在线缓存"""
-    from app.services.grok.assets import DeleteService
+    """娓呯悊鍦ㄧ嚎缂撳瓨"""
+    from app.services.grok.services.assets import DeleteService
     from app.services.token.manager import get_token_manager
     
     delete_service = None
@@ -626,12 +859,12 @@ async def clear_online_cache_api(data: dict):
 
 @router.get("/api/v1/admin/metrics", dependencies=[Depends(verify_api_key)])
 async def get_metrics_api():
-    """数据中心：聚合常用指标（token/cache/request_stats）。"""
+    """鏁版嵁涓績锛氳仛鍚堝父鐢ㄦ寚鏍囷紙token/cache/request_stats锛夈€"""
     try:
         from app.services.request_stats import request_stats
         from app.services.token.manager import get_token_manager
         from app.services.token.models import TokenStatus
-        from app.services.grok.assets import DownloadService
+        from app.services.grok.services.assets import DownloadService
 
         mgr = await get_token_manager()
         await mgr.reload_if_stale()
@@ -688,8 +921,8 @@ async def get_metrics_api():
 
 @router.get("/api/v1/admin/cache/local", dependencies=[Depends(verify_api_key)])
 async def get_cache_local_stats_api():
-    """仅获取本地缓存统计（用于前端实时刷新）。"""
-    from app.services.grok.assets import DownloadService
+    """浠呰幏鍙栨湰鍦扮紦瀛樼粺璁★紙鐢ㄤ簬鍓嶇瀹炴椂鍒锋柊锛夈€"""
+    from app.services.grok.services.assets import DownloadService
 
     try:
         dl_service = DownloadService()
@@ -770,7 +1003,7 @@ def _tail_lines(path: Path, max_lines: int = 2000, max_bytes: int = 1024 * 1024)
 
 @router.get("/api/v1/admin/logs/files", dependencies=[Depends(verify_api_key)])
 async def list_log_files_api():
-    """列出可查看的日志文件（logs/*.log）。"""
+    """鍒楀嚭鍙煡鐪嬬殑鏃ュ織鏂囦欢锛坙ogs/*.log锛夈€"""
     from app.core.logger import LOG_DIR
 
     try:
@@ -795,7 +1028,7 @@ async def list_log_files_api():
 
 @router.get("/api/v1/admin/logs/tail", dependencies=[Depends(verify_api_key)])
 async def tail_log_api(file: str | None = None, lines: int = 500):
-    """读取后台日志（尾部）。"""
+    """璇诲彇鍚庡彴鏃ュ織锛堝熬閮級銆"""
     from app.core.logger import LOG_DIR
 
     try:

@@ -6,7 +6,7 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
-from app.services.grok.model import ModelService
+from app.services.grok.models.model import ModelService
 
 
 router = APIRouter(tags=["Models"])

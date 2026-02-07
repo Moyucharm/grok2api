@@ -7,62 +7,109 @@ let batchQueue = [];
 let batchTotal = 0;
 let batchProcessed = 0;
 let currentBatchAction = null;
-const BATCH_SIZE = 50;
-let autoRegisterJobId = null;
-let autoRegisterTimer = null;
-let autoRegisterLastAdded = 0;
-let liveStatsTimer = null;
-let isWorkersRuntime = false;
+let currentFilter = 'all';
+let currentBatchTaskId = null;
+let batchEventSource = null;
+let currentPage = 1;
+let pageSize = 50;
 
-function setAutoRegisterUiEnabled(enabled) {
-  const btnAuto = document.getElementById('tab-btn-auto');
-  const tabAuto = document.getElementById('add-tab-auto');
-  if (btnAuto) btnAuto.style.display = enabled ? '' : 'none';
-  if (tabAuto) tabAuto.style.display = enabled ? '' : 'none';
-  if (!enabled) {
-    try {
-      switchAddTab('manual');
-    } catch (e) {
-      // ignore
-    }
-  }
+const byId = (id) => document.getElementById(id);
+const qsa = (selector) => document.querySelectorAll(selector);
+const DEFAULT_QUOTA_BASIC = 80;
+const DEFAULT_QUOTA_SUPER = 140;
+
+function getDefaultQuotaForPool(pool) {
+  return pool === 'ssoSuper' ? DEFAULT_QUOTA_SUPER : DEFAULT_QUOTA_BASIC;
 }
 
-async function detectWorkersRuntime() {
+function setText(id, text) {
+  const el = byId(id);
+  if (el) el.innerText = text;
+}
+
+function openModal(id) {
+  const modal = byId(id);
+  if (!modal) return null;
+  modal.classList.remove('hidden');
+  requestAnimationFrame(() => {
+    modal.classList.add('is-open');
+  });
+  return modal;
+}
+
+function closeModal(id, onClose) {
+  const modal = byId(id);
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  setTimeout(() => {
+    modal.classList.add('hidden');
+    if (onClose) onClose();
+  }, 200);
+}
+
+function downloadTextFile(content, filename) {
+  const blob = new Blob([content], { type: 'text/plain' });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+}
+
+async function readJsonResponse(res) {
+  const text = await res.text();
+  if (!text) return null;
   try {
-    const res = await fetch('/health', { cache: 'no-store' });
-    if (!res.ok) return false;
-    const text = await res.text();
-    try {
-      const data = JSON.parse(text);
-      const runtime = (data && data.runtime) ? String(data.runtime) : '';
-      return runtime.toLowerCase() === 'cloudflare-workers';
-    } catch (e) {
-      return /cloudflare-workers/i.test(text);
-    }
-  } catch (e) {
-    return false;
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`响应不是有效 JSON (HTTP ${res.status})`);
   }
 }
 
-async function applyRuntimeUiFlags() {
-  // Default hide first; show back for local/docker after detection.
-  setAutoRegisterUiEnabled(false);
-  isWorkersRuntime = await detectWorkersRuntime();
-  if (!isWorkersRuntime) {
-    setAutoRegisterUiEnabled(true);
-  }
+function getSelectedTokens() {
+  return flatTokens.filter(t => t._selected);
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', applyRuntimeUiFlags);
-} else {
-  applyRuntimeUiFlags();
+function countSelected(tokens) {
+  let count = 0;
+  for (const t of tokens) {
+    if (t._selected) count++;
+  }
+  return count;
+}
+
+function setSelectedForTokens(tokens, selected) {
+  tokens.forEach(t => {
+    t._selected = selected;
+  });
+}
+
+function syncVisibleSelectionUI(selected) {
+  qsa('#token-table-body input[type="checkbox"]').forEach(input => {
+    input.checked = selected;
+  });
+  qsa('#token-table-body tr').forEach(row => {
+    row.classList.toggle('row-selected', selected);
+  });
+}
+
+function getPaginationData() {
+  const filteredTokens = getFilteredTokens();
+  const totalCount = filteredTokens.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  if (currentPage > totalPages) currentPage = totalPages;
+  const startIndex = (currentPage - 1) * pageSize;
+  const visibleTokens = filteredTokens.slice(startIndex, startIndex + pageSize);
+  return { filteredTokens, totalCount, totalPages, visibleTokens };
 }
 
 async function init() {
   apiKey = await ensureApiKey();
   if (apiKey === null) return;
+  setupEditPoolDefaults();
   setupConfirmDialog();
   loadData();
   startLiveStats();
@@ -164,7 +211,7 @@ function processTokens(data) {
       tokens.forEach(t => {
         // Normalize
         const tObj = typeof t === 'string'
-          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0, age_verified: false, age_status: 'unknown', nsfw_status: 'unknown' }
+          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0, tags: [] }
           : {
             token: t.token,
             status: t.status || 'active',
@@ -172,9 +219,13 @@ function processTokens(data) {
             note: t.note || '',
             fail_count: t.fail_count || 0,
             use_count: t.use_count || 0,
-            age_verified: Boolean(t.age_verified),
-            age_status: String(t.age_status || (t.age_verified ? 'verified' : 'unknown')),
-            nsfw_status: String(t.nsfw_status || 'unknown')
+            tags: t.tags || [],
+            created_at: t.created_at,
+            last_used_at: t.last_used_at,
+            last_fail_at: t.last_fail_at,
+            last_fail_reason: t.last_fail_reason,
+            last_sync_at: t.last_sync_at,
+            last_asset_clear_at: t.last_asset_clear_at
           };
         flatTokens.push({ ...tObj, pool: pool, _selected: false });
       });
@@ -188,6 +239,8 @@ function updateStats(data) {
   let activeTokens = 0;
   let coolingTokens = 0;
   let invalidTokens = 0;
+  let nsfwTokens = 0;
+  let noNsfwTokens = 0;
   let chatQuota = 0;
   let totalCalls = 0;
 
@@ -200,15 +253,15 @@ function updateStats(data) {
     } else {
       invalidTokens++;
     }
+    if (t.tags && t.tags.includes('nsfw')) {
+      nsfwTokens++;
+    } else {
+      noNsfwTokens++;
+    }
     totalCalls += Number(t.use_count || 0);
   });
 
   const imageQuota = Math.floor(chatQuota / 2);
-
-  const setText = (id, text) => {
-    const el = document.getElementById(id);
-    if (el) el.innerText = text;
-  };
 
   setText('stat-total', totalTokens.toLocaleString());
   setText('stat-active', activeTokens.toLocaleString());
@@ -218,29 +271,55 @@ function updateStats(data) {
   setText('stat-chat-quota', chatQuota.toLocaleString());
   setText('stat-image-quota', imageQuota.toLocaleString());
   setText('stat-total-calls', totalCalls.toLocaleString());
+
+  updateTabCounts({
+    all: totalTokens,
+    active: activeTokens,
+    cooling: coolingTokens,
+    expired: invalidTokens,
+    nsfw: nsfwTokens,
+    'no-nsfw': noNsfwTokens
+  });
 }
 
 function renderTable() {
-  const tbody = document.getElementById('token-table-body');
-  const loading = document.getElementById('loading');
-  const emptyState = document.getElementById('empty-state');
+  const tbody = byId('token-table-body');
+  const loading = byId('loading');
+  const emptyState = byId('empty-state');
 
-  tbody.innerHTML = '';
-  loading.classList.add('hidden');
+  if (loading) loading.classList.add('hidden');
 
-  if (flatTokens.length === 0) {
+  // 获取筛选后的列表
+  const { totalCount, totalPages, visibleTokens } = getPaginationData();
+  const indexByRef = new Map(flatTokens.map((t, i) => [t, i]));
+
+  updatePaginationControls(totalCount, totalPages);
+
+  if (visibleTokens.length === 0) {
+    tbody.replaceChildren();
+    if (emptyState) {
+      emptyState.textContent = currentFilter === 'all'
+        ? '暂无 Token，请点击右上角导入或添加。'
+        : '当前筛选无结果，请切换筛选条件。';
+    }
     emptyState.classList.remove('hidden');
+    updateSelectionState();
     return;
   }
   emptyState.classList.add('hidden');
 
-  flatTokens.forEach((item, index) => {
+  const fragment = document.createDocumentFragment();
+  visibleTokens.forEach((item) => {
+    // 获取原始索引用于操作
+    const originalIndex = indexByRef.get(item);
     const tr = document.createElement('tr');
+    tr.dataset.index = originalIndex;
+    if (item._selected) tr.classList.add('row-selected');
 
     // Checkbox (Center)
     const tdCheck = document.createElement('td');
     tdCheck.className = 'text-center';
-    tdCheck.innerHTML = `<input type="checkbox" class="checkbox" ${item._selected ? 'checked' : ''} onchange="toggleSelect(${index})">`;
+    tdCheck.innerHTML = `<input type="checkbox" class="checkbox" ${item._selected ? 'checked' : ''} onchange="toggleSelect(${originalIndex})">`;
 
     // Token (Left)
     const tdToken = document.createElement('td');
@@ -262,14 +341,18 @@ function renderTable() {
     tdType.className = 'text-center';
     tdType.innerHTML = `<span class="badge badge-gray">${escapeHtml(item.pool)}</span>`;
 
-    // Status (Center)
+    // Status (Center) - 显示状态和 nsfw 标签
     const tdStatus = document.createElement('td');
     let statusClass = 'badge-gray';
     if (item.status === 'active') statusClass = 'badge-green';
     else if (item.status === 'cooling') statusClass = 'badge-orange';
     else statusClass = 'badge-red';
     tdStatus.className = 'text-center';
-    tdStatus.innerHTML = `<span class="badge ${statusClass}">${item.status}</span>`;
+    let statusHtml = `<span class="badge ${statusClass}">${item.status}</span>`;
+    if (item.tags && item.tags.includes('nsfw')) {
+      statusHtml += ` <span class="badge badge-purple">nsfw</span>`;
+    }
+    tdStatus.innerHTML = statusHtml;
 
     // Quota (Center)
     const tdQuota = document.createElement('td');
@@ -311,10 +394,10 @@ function renderTable() {
                      <button onclick="refreshStatus('${item.token}')" class="p-1 text-gray-400 hover:text-black rounded" title="刷新状态">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
                      </button>
-                     <button onclick="openEditModal(${index})" class="p-1 text-gray-400 hover:text-black rounded" title="编辑">
+                     <button onclick="openEditModal(${originalIndex})" class="p-1 text-gray-400 hover:text-black rounded" title="编辑">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                      </button>
-                     <button onclick="deleteToken(${index})" class="p-1 text-gray-400 hover:text-red-600 rounded" title="删除">
+                     <button onclick="deleteToken(${originalIndex})" class="p-1 text-gray-400 hover:text-red-600 rounded" title="删除">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                      </button>
                 </div>
@@ -330,32 +413,67 @@ function renderTable() {
     tr.appendChild(tdNote);
     tr.appendChild(tdActions);
 
-    tbody.appendChild(tr);
+    fragment.appendChild(tr);
   });
 
+  tbody.replaceChildren(fragment);
   updateSelectionState();
 }
 
 // Selection Logic
 function toggleSelectAll() {
-  const checkbox = document.getElementById('select-all');
-  const checked = checkbox.checked;
-  flatTokens.forEach(t => t._selected = checked);
-  renderTable();
+  const checkbox = byId('select-all');
+  const checked = !!(checkbox && checkbox.checked);
+  // 只选择当前页可见的 Token
+  setSelectedForTokens(getVisibleTokens(), checked);
+  syncVisibleSelectionUI(checked);
+  updateSelectionState();
+}
+
+function selectAllFiltered() {
+  const filtered = getFilteredTokens();
+  if (filtered.length === 0) return;
+  setSelectedForTokens(filtered, true);
+  syncVisibleSelectionUI(true);
+  updateSelectionState();
+}
+
+function selectVisibleAll() {
+  const visible = getVisibleTokens();
+  if (visible.length === 0) return;
+  setSelectedForTokens(visible, true);
+  syncVisibleSelectionUI(true);
+  updateSelectionState();
+}
+
+function clearAllSelection() {
+  if (flatTokens.length === 0) return;
+  setSelectedForTokens(flatTokens, false);
+  syncVisibleSelectionUI(false);
+  updateSelectionState();
 }
 
 function toggleSelect(index) {
   flatTokens[index]._selected = !flatTokens[index]._selected;
+  const row = document.querySelector(`#token-table-body tr[data-index="${index}"]`);
+  if (row) row.classList.toggle('row-selected', flatTokens[index]._selected);
   updateSelectionState();
 }
 
 function updateSelectionState() {
-  const selectedCount = flatTokens.filter(t => t._selected).length;
-  const allSelected = flatTokens.length > 0 && selectedCount === flatTokens.length;
-
-  document.getElementById('select-all').checked = allSelected;
-  document.getElementById('selected-count').innerText = selectedCount;
-  setActionButtonsState();
+  const selectedCount = countSelected(flatTokens);
+  const visible = getVisibleTokens();
+  const visibleSelected = countSelected(visible);
+  const selectAll = byId('select-all');
+  if (selectAll) {
+    const hasVisible = visible.length > 0;
+    selectAll.disabled = !hasVisible;
+    selectAll.checked = hasVisible && visibleSelected === visible.length;
+    selectAll.indeterminate = visibleSelected > 0 && visibleSelected < visible.length;
+  }
+  const selectedCountEl = byId('selected-count');
+  if (selectedCountEl) selectedCountEl.innerText = selectedCount;
+  setActionButtonsState(selectedCount);
 }
 
 // Actions
@@ -365,19 +483,10 @@ function addToken() {
 
 // Batch export (Selected only)
 function batchExport() {
-  const selected = flatTokens.filter(t => t._selected);
-  if (selected.length === 0) return showToast('未选择 Token', 'error');
-  let content = "";
-  selected.forEach(t => content += t.token + "\n");
-  const blob = new Blob([content], { type: 'text/plain' });
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `tokens_export_selected_${new Date().toISOString().slice(0, 10)}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  window.URL.revokeObjectURL(url);
-  document.body.removeChild(a);
+  const selected = getSelectedTokens();
+  if (selected.length === 0) return showToast("未选择 Token", 'error');
+  const content = selected.map(t => t.token).join('\n') + '\n';
+  downloadTextFile(content, `tokens_export_selected_${new Date().toISOString().slice(0, 10)}.txt`);
 }
 
 
@@ -683,7 +792,7 @@ async function pollAutoRegisterStatus() {
 // Modal Logic
 let currentEditIndex = -1;
 function openEditModal(index) {
-  const modal = document.getElementById('edit-modal');
+  const modal = byId('edit-modal');
   if (!modal) return;
 
   currentEditIndex = index;
@@ -691,55 +800,59 @@ function openEditModal(index) {
   if (index >= 0) {
     // Edit existing
     const item = flatTokens[index];
-    document.getElementById('edit-token-display').value = item.token;
-    document.getElementById('edit-original-token').value = item.token;
-    document.getElementById('edit-original-pool').value = item.pool;
-    document.getElementById('edit-pool').value = item.pool;
-    document.getElementById('edit-quota').value = item.quota;
-    document.getElementById('edit-note').value = item.note;
+    byId('edit-token-display').value = item.token;
+    byId('edit-original-token').value = item.token;
+    byId('edit-original-pool').value = item.pool;
+    byId('edit-pool').value = item.pool;
+    byId('edit-quota').value = item.quota;
+    byId('edit-note').value = item.note;
     document.querySelector('#edit-modal h3').innerText = '编辑 Token';
   } else {
     // New Token
-    document.getElementById('edit-token-display').value = '';
-    document.getElementById('edit-token-display').disabled = false;
-    document.getElementById('edit-token-display').placeholder = 'sk-...';
-    document.getElementById('edit-token-display').classList.remove('bg-gray-50', 'text-gray-500');
+    const tokenInput = byId('edit-token-display');
+    tokenInput.value = '';
+    tokenInput.disabled = false;
+    tokenInput.placeholder = 'sk-...';
+    tokenInput.classList.remove('bg-gray-50', 'text-gray-500');
 
-    document.getElementById('edit-original-token').value = '';
-    document.getElementById('edit-original-pool').value = '';
-    document.getElementById('edit-pool').value = 'ssoBasic';
-    document.getElementById('edit-quota').value = 80;
-    document.getElementById('edit-note').value = '';
+    byId('edit-original-token').value = '';
+    byId('edit-original-pool').value = '';
+    byId('edit-pool').value = 'ssoBasic';
+    byId('edit-quota').value = getDefaultQuotaForPool('ssoBasic');
+    byId('edit-note').value = '';
     document.querySelector('#edit-modal h3').innerText = '添加 Token';
   }
 
-  modal.classList.remove('hidden');
-  requestAnimationFrame(() => {
-    modal.classList.add('is-open');
+  openModal('edit-modal');
+}
+
+function setupEditPoolDefaults() {
+  const poolSelect = byId('edit-pool');
+  const quotaInput = byId('edit-quota');
+  if (!poolSelect || !quotaInput) return;
+  poolSelect.addEventListener('change', () => {
+    if (currentEditIndex >= 0) return;
+    quotaInput.value = getDefaultQuotaForPool(poolSelect.value);
   });
 }
 
 function closeEditModal() {
-  const modal = document.getElementById('edit-modal');
-  if (!modal) return;
-  modal.classList.remove('is-open');
-  setTimeout(() => {
-    modal.classList.add('hidden');
+  closeModal('edit-modal', () => {
     // reset styles for token input
-    const input = document.getElementById('edit-token-display');
+    const input = byId('edit-token-display');
     if (input) {
       input.disabled = true;
       input.classList.add('bg-gray-50', 'text-gray-500');
     }
-  }, 200);
+  });
 }
 
 async function saveEdit() {
   // Collect data
-  let token, pool, quota, note;
-  const newPool = document.getElementById('edit-pool').value.trim();
-  const newQuota = parseInt(document.getElementById('edit-quota').value) || 0;
-  const newNote = document.getElementById('edit-note').value.trim().slice(0, 50);
+  let token;
+  const newPool = byId('edit-pool').value.trim();
+  const newQuota = parseInt(byId('edit-quota').value) || 0;
+  const newNote = byId('edit-note').value.trim().slice(0, 50);
 
   if (currentEditIndex >= 0) {
     // Updating existing
@@ -752,7 +865,7 @@ async function saveEdit() {
     item.note = newNote;
   } else {
     // Creating new
-    token = document.getElementById('edit-token-display').value.trim();
+    token = byId('edit-token-display').value.trim();
     if (!token) return showToast('Token 不能为空', 'error');
 
     // Check if exists
@@ -794,14 +907,22 @@ async function syncToServer() {
   const newTokens = {};
   flatTokens.forEach(t => {
     if (!newTokens[t.pool]) newTokens[t.pool] = [];
-    newTokens[t.pool].push({
+    const payload = {
       token: t.token,
       status: t.status,
       quota: t.quota,
       note: t.note,
       fail_count: t.fail_count,
-      use_count: t.use_count || 0
-    });
+      use_count: t.use_count || 0,
+      tags: Array.isArray(t.tags) ? t.tags : []
+    };
+    if (typeof t.created_at === 'number') payload.created_at = t.created_at;
+    if (typeof t.last_used_at === 'number') payload.last_used_at = t.last_used_at;
+    if (typeof t.last_fail_at === 'number') payload.last_fail_at = t.last_fail_at;
+    if (typeof t.last_sync_at === 'number') payload.last_sync_at = t.last_sync_at;
+    if (typeof t.last_asset_clear_at === 'number') payload.last_asset_clear_at = t.last_asset_clear_at;
+    if (typeof t.last_fail_reason === 'string' && t.last_fail_reason) payload.last_fail_reason = t.last_fail_reason;
+    newTokens[t.pool].push(payload);
   });
 
   try {
@@ -821,29 +942,21 @@ async function syncToServer() {
 
 // Import Logic
 function openImportModal() {
-  const modal = document.getElementById('import-modal');
-  if (!modal) return;
-  modal.classList.remove('hidden');
-  requestAnimationFrame(() => {
-    modal.classList.add('is-open');
-  });
+  openModal('import-modal');
 }
 
 function closeImportModal() {
-  const modal = document.getElementById('import-modal');
-  if (!modal) return;
-  modal.classList.remove('is-open');
-  setTimeout(() => {
-    modal.classList.add('hidden');
-    const input = document.getElementById('import-text');
+  closeModal('import-modal', () => {
+    const input = byId('import-text');
     if (input) input.value = '';
-  }, 200);
+  });
 }
 
 async function submitImport() {
-  const pool = document.getElementById('import-pool').value.trim() || 'ssoBasic';
-  const text = document.getElementById('import-text').value;
+  const pool = byId('import-pool').value.trim() || 'ssoBasic';
+  const text = byId('import-text').value;
   const lines = text.split('\n');
+  const defaultQuota = getDefaultQuotaForPool(pool);
 
   lines.forEach(line => {
     const t = line.trim();
@@ -852,8 +965,10 @@ async function submitImport() {
         token: t,
         pool: pool,
         status: 'active',
-        quota: 80,
+        quota: defaultQuota,
         note: '',
+        tags: [],
+        fail_count: 0,
         use_count: 0,
         _selected: false
       });
@@ -867,19 +982,9 @@ async function submitImport() {
 
 // Export Logic
 function exportTokens() {
-  let content = "";
-  flatTokens.forEach(t => content += t.token + "\n");
-  if (!content) return showToast('列表为空', 'error');
-
-  const blob = new Blob([content], { type: 'text/plain' });
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `tokens_export_${new Date().toISOString().slice(0, 10)}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  window.URL.revokeObjectURL(url);
-  document.body.removeChild(a);
+  if (flatTokens.length === 0) return showToast("列表为空", 'error');
+  const content = flatTokens.map(t => t.token).join('\n') + '\n';
+  downloadTextFile(content, `tokens_export_${new Date().toISOString().slice(0, 10)}.txt`);
 }
 
 async function copyToClipboard(text, btn) {
@@ -936,14 +1041,15 @@ async function refreshStatus(token) {
   }
 }
 
+
 async function startBatchRefresh() {
   if (isBatchProcessing) {
     showToast('当前有任务进行中', 'info');
     return;
   }
 
-  const selected = flatTokens.filter(t => t._selected);
-  if (selected.length === 0) return showToast('未选择 Token', 'error');
+  const selected = getSelectedTokens();
+  if (selected.length === 0) return showToast("未选择 Token", 'error');
 
   // Init state
   isBatchProcessing = true;
@@ -955,70 +1061,88 @@ async function startBatchRefresh() {
 
   updateBatchProgress();
   setActionButtonsState();
-  processBatchQueue();
-}
-
-async function processBatchQueue() {
-  if (!isBatchProcessing || isBatchPaused || currentBatchAction !== 'refresh') return;
-
-  if (batchQueue.length === 0) {
-    // Done
-    finishBatchProcess();
-    return;
-  }
-
-  // Take chunk
-  const chunk = batchQueue.splice(0, BATCH_SIZE);
 
   try {
-    const res = await fetch('/api/v1/admin/tokens/refresh', {
+    const res = await fetch('/api/v1/admin/tokens/refresh/async', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...buildAuthHeaders(apiKey)
       },
-      body: JSON.stringify({ tokens: chunk })
+      body: JSON.stringify({ tokens: batchQueue })
     });
-
-    if (res.ok) {
-      batchProcessed += chunk.length;
-    } else {
-      showToast('部分刷新失败', 'error');
-      batchProcessed += chunk.length;
+    const data = await res.json();
+    if (!res.ok || data.status !== 'success') {
+      throw new Error(data.detail || '请求失败');
     }
-  } catch (e) {
-    showToast('网络请求错误', 'error');
-    batchProcessed += chunk.length;
-  }
-  updateBatchProgress();
 
-  // Recursive call for next batch
-  // Small delay to allow UI updates and interactions
-  if (!isBatchProcessing || isBatchPaused) return;
-  setTimeout(() => {
-    processBatchQueue();
-  }, 400);
+    currentBatchTaskId = data.task_id;
+    BatchSSE.close(batchEventSource);
+    batchEventSource = BatchSSE.open(currentBatchTaskId, apiKey, {
+      onMessage: (msg) => {
+        if (msg.type === 'snapshot' || msg.type === 'progress') {
+          if (typeof msg.total === 'number') batchTotal = msg.total;
+          if (typeof msg.processed === 'number') batchProcessed = msg.processed;
+          updateBatchProgress();
+        } else if (msg.type === 'done') {
+          if (typeof msg.total === 'number') batchTotal = msg.total;
+          batchProcessed = batchTotal;
+          updateBatchProgress();
+          finishBatchProcess(false, { silent: true });
+          if (msg.warning) {
+            showToast(`刷新完成\n⚠️ ${msg.warning}`, 'warning');
+          } else {
+            showToast('刷新完成', 'success');
+          }
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+        } else if (msg.type === 'cancelled') {
+          finishBatchProcess(true, { silent: true });
+          showToast('已终止刷新', 'info');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+        } else if (msg.type === 'error') {
+          finishBatchProcess(true, { silent: true });
+          showToast('刷新失败: ' + (msg.error || '未知错误'), 'error');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+        }
+      },
+      onError: () => {
+        finishBatchProcess(true, { silent: true });
+        showToast('连接中断', 'error');
+        currentBatchTaskId = null;
+        BatchSSE.close(batchEventSource);
+        batchEventSource = null;
+      }
+    });
+  } catch (e) {
+    finishBatchProcess(true, { silent: true });
+    showToast(e.message || '请求失败', 'error');
+    currentBatchTaskId = null;
+  }
 }
 
 function toggleBatchPause() {
   if (!isBatchProcessing) return;
-  isBatchPaused = !isBatchPaused;
-  updateBatchProgress();
-  if (!isBatchPaused) {
-    if (currentBatchAction === 'refresh') {
-      processBatchQueue();
-    } else if (currentBatchAction === 'delete') {
-      processDeleteQueue();
-    }
-  }
+  showToast('当前任务不支持暂停', 'info');
 }
 
 function stopBatchRefresh() {
   if (!isBatchProcessing) return;
+  if (currentBatchTaskId) {
+    BatchSSE.cancel(currentBatchTaskId, apiKey);
+    BatchSSE.close(batchEventSource);
+    batchEventSource = null;
+    currentBatchTaskId = null;
+  }
   finishBatchProcess(true);
 }
 
-function finishBatchProcess(aborted = false) {
+function finishBatchProcess(aborted = false, options = {}) {
   const action = currentBatchAction;
   isBatchProcessing = false;
   isBatchPaused = false;
@@ -1030,10 +1154,23 @@ function finishBatchProcess(aborted = false) {
   updateSelectionState();
   loadData(); // Final data refresh
 
+  if (options.silent) return;
   if (aborted) {
-    showToast(action === 'delete' ? '已终止删除' : '已终止刷新', 'info');
+    if (action === 'delete') {
+      showToast('已终止删除', 'info');
+    } else if (action === 'nsfw') {
+      showToast('已终止 NSFW', 'info');
+    } else {
+      showToast('已终止刷新', 'info');
+    }
   } else {
-    showToast(action === 'delete' ? '删除完成' : '刷新完成', 'success');
+    if (action === 'delete') {
+      showToast('删除完成', 'success');
+    } else if (action === 'nsfw') {
+      showToast('NSFW 开启完成', 'success');
+    } else {
+      showToast('刷新完成', 'success');
+    }
   }
 }
 
@@ -1042,10 +1179,10 @@ async function batchUpdate() {
 }
 
 function updateBatchProgress() {
-  const container = document.getElementById('batch-progress');
-  const text = document.getElementById('batch-progress-text');
-  const pauseBtn = document.getElementById('btn-pause-action');
-  const stopBtn = document.getElementById('btn-stop-action');
+  const container = byId('batch-progress');
+  const text = byId('batch-progress-text');
+  const pauseBtn = byId('btn-pause-action');
+  const stopBtn = byId('btn-stop-action');
   if (!container || !text) return;
   if (!isBatchProcessing) {
     container.classList.add('hidden');
@@ -1057,21 +1194,25 @@ function updateBatchProgress() {
   text.textContent = `${pct}%`;
   container.classList.remove('hidden');
   if (pauseBtn) {
-    pauseBtn.textContent = isBatchPaused ? '继续' : '暂停';
-    pauseBtn.classList.remove('hidden');
+    pauseBtn.classList.add('hidden');
   }
   if (stopBtn) stopBtn.classList.remove('hidden');
 }
 
-function setActionButtonsState() {
-  const selectedCount = flatTokens.filter(t => t._selected).length;
+function setActionButtonsState(selectedCount = null) {
+  let count = selectedCount;
+  if (count === null) {
+    count = countSelected(flatTokens);
+  }
   const disabled = isBatchProcessing;
-  const exportBtn = document.getElementById('btn-batch-export');
-  const updateBtn = document.getElementById('btn-batch-update');
-  const deleteBtn = document.getElementById('btn-batch-delete');
-  if (exportBtn) exportBtn.disabled = disabled || selectedCount === 0;
-  if (updateBtn) updateBtn.disabled = disabled || selectedCount === 0;
-  if (deleteBtn) deleteBtn.disabled = disabled || selectedCount === 0;
+  const exportBtn = byId('btn-batch-export');
+  const updateBtn = byId('btn-batch-update');
+  const nsfwBtn = byId('btn-batch-nsfw');
+  const deleteBtn = byId('btn-batch-delete');
+  if (exportBtn) exportBtn.disabled = disabled || count === 0;
+  if (updateBtn) updateBtn.disabled = disabled || count === 0;
+  if (nsfwBtn) nsfwBtn.disabled = disabled || count === 0;
+  if (deleteBtn) deleteBtn.disabled = disabled || count === 0;
 }
 
 async function startBatchDelete() {
@@ -1079,8 +1220,8 @@ async function startBatchDelete() {
     showToast('当前有任务进行中', 'info');
     return;
   }
-  const selected = flatTokens.filter(t => t._selected);
-  if (selected.length === 0) return showToast('未选择 Token', 'error');
+  const selected = getSelectedTokens();
+  if (selected.length === 0) return showToast("未选择 Token", 'error');
   const ok = await confirmAction(`确定要删除选中的 ${selected.length} 个 Token 吗？`, { okText: '删除' });
   if (!ok) return;
 
@@ -1093,16 +1234,28 @@ async function startBatchDelete() {
 
   updateBatchProgress();
   setActionButtonsState();
-  processDeleteQueue();
+
+  try {
+    const toRemove = new Set(batchQueue);
+    flatTokens = flatTokens.filter(t => !toRemove.has(t.token));
+    await syncToServer();
+    batchProcessed = batchTotal;
+    updateBatchProgress();
+    finishBatchProcess(false, { silent: true });
+    showToast('删除完成', 'success');
+  } catch (e) {
+    finishBatchProcess(true, { silent: true });
+    showToast('删除失败', 'error');
+  }
 }
 
 let confirmResolver = null;
 
 function setupConfirmDialog() {
-  const dialog = document.getElementById('confirm-dialog');
+  const dialog = byId('confirm-dialog');
   if (!dialog) return;
-  const okBtn = document.getElementById('confirm-ok');
-  const cancelBtn = document.getElementById('confirm-cancel');
+  const okBtn = byId('confirm-ok');
+  const cancelBtn = byId('confirm-cancel');
   dialog.addEventListener('click', (event) => {
     if (event.target === dialog) {
       closeConfirm(false);
@@ -1113,13 +1266,13 @@ function setupConfirmDialog() {
 }
 
 function confirmAction(message, options = {}) {
-  const dialog = document.getElementById('confirm-dialog');
+  const dialog = byId('confirm-dialog');
   if (!dialog) {
     return Promise.resolve(false);
   }
-  const messageEl = document.getElementById('confirm-message');
-  const okBtn = document.getElementById('confirm-ok');
-  const cancelBtn = document.getElementById('confirm-cancel');
+  const messageEl = byId('confirm-message');
+  const okBtn = byId('confirm-ok');
+  const cancelBtn = byId('confirm-cancel');
   if (messageEl) messageEl.textContent = message;
   if (okBtn) okBtn.textContent = options.okText || '确定';
   if (cancelBtn) cancelBtn.textContent = options.cancelText || '取消';
@@ -1133,7 +1286,7 @@ function confirmAction(message, options = {}) {
 }
 
 function closeConfirm(ok) {
-  const dialog = document.getElementById('confirm-dialog');
+  const dialog = byId('confirm-dialog');
   if (!dialog) return;
   dialog.classList.remove('is-open');
   setTimeout(() => {
@@ -1145,29 +1298,6 @@ function closeConfirm(ok) {
   }, 200);
 }
 
-async function processDeleteQueue() {
-  if (!isBatchProcessing || isBatchPaused || currentBatchAction !== 'delete') return;
-  if (batchQueue.length === 0) {
-    finishBatchProcess();
-    return;
-  }
-  const chunk = batchQueue.splice(0, BATCH_SIZE);
-  const toRemove = new Set(chunk);
-  flatTokens = flatTokens.filter(t => !toRemove.has(t.token));
-  try {
-    await syncToServer();
-    batchProcessed += chunk.length;
-  } catch (e) {
-    showToast('删除失败', 'error');
-    batchProcessed += chunk.length;
-  }
-  updateBatchProgress();
-  if (!isBatchProcessing || isBatchPaused) return;
-  setTimeout(() => {
-    processDeleteQueue();
-  }, 400);
-}
-
 function escapeHtml(text) {
   if (!text) return '';
   return text
@@ -1176,6 +1306,208 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+// ========== Tab 筛选功能 ==========
+
+function filterByStatus(status) {
+  currentFilter = status;
+  currentPage = 1;
+
+  // 更新 Tab 样式和 ARIA
+  document.querySelectorAll('.tab-item').forEach(tab => {
+    const isActive = tab.dataset.filter === status;
+    tab.classList.toggle('active', isActive);
+    tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+
+  renderTable();
+}
+
+function getFilteredTokens() {
+  if (currentFilter === 'all') return flatTokens;
+
+  return flatTokens.filter(t => {
+    if (currentFilter === 'active') return t.status === 'active';
+    if (currentFilter === 'cooling') return t.status === 'cooling';
+    if (currentFilter === 'expired') return t.status !== 'active' && t.status !== 'cooling';
+    if (currentFilter === 'nsfw') return t.tags && t.tags.includes('nsfw');
+    if (currentFilter === 'no-nsfw') return !t.tags || !t.tags.includes('nsfw');
+    return true;
+  });
+}
+
+function updateTabCounts(counts) {
+  const safeCounts = counts || {
+    all: flatTokens.length,
+    active: flatTokens.filter(t => t.status === 'active').length,
+    cooling: flatTokens.filter(t => t.status === 'cooling').length,
+    expired: flatTokens.filter(t => t.status !== 'active' && t.status !== 'cooling').length,
+    nsfw: flatTokens.filter(t => t.tags && t.tags.includes('nsfw')).length,
+    'no-nsfw': flatTokens.filter(t => !t.tags || !t.tags.includes('nsfw')).length
+  };
+
+  Object.entries(safeCounts).forEach(([key, count]) => {
+    const el = byId(`tab-count-${key}`);
+    if (el) el.textContent = count;
+  });
+}
+
+function getVisibleTokens() {
+  return getPaginationData().visibleTokens;
+}
+
+function updatePaginationControls(totalCount, totalPages) {
+  const info = byId('pagination-info');
+  const prevBtn = byId('page-prev');
+  const nextBtn = byId('page-next');
+  const sizeSelect = byId('page-size');
+
+  if (sizeSelect && String(sizeSelect.value) !== String(pageSize)) {
+    sizeSelect.value = String(pageSize);
+  }
+
+  if (info) {
+    info.textContent = `第 ${totalCount === 0 ? 0 : currentPage} / ${totalPages} 页 · 共 ${totalCount} 条`;
+  }
+  if (prevBtn) prevBtn.disabled = totalCount === 0 || currentPage <= 1;
+  if (nextBtn) nextBtn.disabled = totalCount === 0 || currentPage >= totalPages;
+}
+
+function goPrevPage() {
+  if (currentPage <= 1) return;
+  currentPage -= 1;
+  renderTable();
+}
+
+function goNextPage() {
+  const totalCount = getFilteredTokens().length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  if (currentPage >= totalPages) return;
+  currentPage += 1;
+  renderTable();
+}
+
+function changePageSize() {
+  const sizeSelect = byId('page-size');
+  const value = sizeSelect ? parseInt(sizeSelect.value, 10) : 0;
+  if (!value || value === pageSize) return;
+  pageSize = value;
+  currentPage = 1;
+  renderTable();
+}
+
+// ========== NSFW 批量开启 ==========
+
+async function batchEnableNSFW() {
+  if (isBatchProcessing) {
+    showToast('当前有任务进行中', 'info');
+    return;
+  }
+
+  const selected = getSelectedTokens();
+  const targetCount = selected.length;
+  if (targetCount === 0) {
+    showToast('未选择 Token', 'error');
+    return;
+  }
+  const msg = `是否为选中的 ${targetCount} 个 Token 开启 NSFW 模式？`;
+
+  const ok = await confirmAction(msg, { okText: '开启 NSFW' });
+  if (!ok) return;
+
+  // 禁用按钮
+  const btn = byId('btn-batch-nsfw');
+  if (btn) btn.disabled = true;
+
+  isBatchProcessing = true;
+  currentBatchAction = 'nsfw';
+  batchTotal = targetCount;
+  batchProcessed = 0;
+  updateBatchProgress();
+  setActionButtonsState();
+
+  try {
+    const tokens = selected.length > 0 ? selected.map(t => t.token) : null;
+    const res = await fetch('/api/v1/admin/tokens/nsfw/enable/async', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({ tokens })
+    });
+
+    const data = await readJsonResponse(res);
+    if (!res.ok) {
+      const detail = data && (data.detail || data.message);
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    if (!data) {
+      throw new Error(`空响应 (HTTP ${res.status})`);
+    }
+    if (data.status !== 'success') {
+      throw new Error(data.detail || '请求失败');
+    }
+
+    currentBatchTaskId = data.task_id;
+    BatchSSE.close(batchEventSource);
+    batchEventSource = BatchSSE.open(currentBatchTaskId, apiKey, {
+      onMessage: (msg) => {
+        if (msg.type === 'snapshot' || msg.type === 'progress') {
+          if (typeof msg.total === 'number') batchTotal = msg.total;
+          if (typeof msg.processed === 'number') batchProcessed = msg.processed;
+          updateBatchProgress();
+        } else if (msg.type === 'done') {
+          if (typeof msg.total === 'number') batchTotal = msg.total;
+          batchProcessed = batchTotal;
+          updateBatchProgress();
+          finishBatchProcess(false, { silent: true });
+          const summary = msg.result && msg.result.summary ? msg.result.summary : null;
+          const okCount = summary ? summary.ok : 0;
+          const failCount = summary ? summary.fail : 0;
+          let text = `NSFW 开启完成：成功 ${okCount}，失败 ${failCount}`;
+          if (msg.warning) text += `\n⚠️ ${msg.warning}`;
+          showToast(text, failCount > 0 || msg.warning ? 'warning' : 'success');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+          if (btn) btn.disabled = false;
+          setActionButtonsState();
+        } else if (msg.type === 'cancelled') {
+          finishBatchProcess(true, { silent: true });
+          showToast('已终止 NSFW', 'info');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+          if (btn) btn.disabled = false;
+          setActionButtonsState();
+        } else if (msg.type === 'error') {
+          finishBatchProcess(true, { silent: true });
+          showToast('开启失败: ' + (msg.error || '未知错误'), 'error');
+          currentBatchTaskId = null;
+          BatchSSE.close(batchEventSource);
+          batchEventSource = null;
+          if (btn) btn.disabled = false;
+          setActionButtonsState();
+        }
+      },
+      onError: () => {
+        finishBatchProcess(true, { silent: true });
+        showToast('连接中断', 'error');
+        currentBatchTaskId = null;
+        BatchSSE.close(batchEventSource);
+        batchEventSource = null;
+        if (btn) btn.disabled = false;
+        setActionButtonsState();
+      }
+    });
+  } catch (e) {
+    finishBatchProcess(true, { silent: true });
+    showToast('请求错误: ' + e.message, 'error');
+    if (btn) btn.disabled = false;
+    setActionButtonsState();
+  }
 }
 
 
