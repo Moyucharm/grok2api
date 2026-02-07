@@ -164,6 +164,13 @@ app.get("/admin/chat", (c) => {
   return fetchAsset(c, "/chat/chat_admin.html");
 });
 
+app.get("/admin/imagine", (c) => {
+  const buildSha = getBuildSha(c.env as Env);
+  const v = c.req.query("v") ?? "";
+  if (v !== buildSha) return c.redirect(`/admin/imagine?v=${encodeURIComponent(buildSha)}`, 302);
+  return fetchAsset(c, "/imagine/imagine.html");
+});
+
 app.get("/static/*", (c) => {
   const url = new URL(c.req.url);
   if (url.pathname === "/static/_worker.js") return c.notFound();

@@ -8,7 +8,7 @@ from pathlib import Path
 import aiofiles
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
-from app.services.grok.assets import DownloadService
+from app.services.grok.services.assets import DownloadService
 
 
 router = APIRouter(tags=["Uploads"])

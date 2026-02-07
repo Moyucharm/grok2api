@@ -1,11 +1,15 @@
 ﻿let apiKey = '';
 let currentConfig = {};
+const byId = (id) => document.getElementById(id);
 const NUMERIC_FIELDS = new Set([
   'timeout',
   'max_retry',
-  'imagine_max_retries',
-  'imagine_blocked_retry_limit',
+  'retry_backoff_base',
+  'retry_backoff_factor',
+  'retry_backoff_max',
+  'retry_budget',
   'refresh_interval_hours',
+  'super_refresh_interval_hours',
   'fail_threshold',
   'limit_mb',
   'save_delay_ms',
@@ -13,81 +17,109 @@ const NUMERIC_FIELDS = new Set([
   'media_max_concurrent',
   'usage_max_concurrent',
   'assets_delete_batch_size',
-  'admin_assets_batch_size',
+  'assets_batch_size',
+  'assets_max_tokens',
+  'usage_batch_size',
+  'usage_max_tokens',
   'reload_interval_sec',
-  'solver_threads',
-  'register_threads',
-  'default_count'
+  'stream_idle_timeout',
+  'video_idle_timeout',
+  'image_ws_blocked_seconds',
+  'image_ws_final_min_bytes',
+  'image_ws_medium_min_bytes',
+  'nsfw_max_concurrent',
+  'nsfw_batch_size',
+  'nsfw_max_tokens'
 ]);
 
 const LOCALE_MAP = {
   "app": {
     "label": "应用设置",
-    "api_key": { title: "API 密钥", desc: "调用 Grok2API 服务所需的 Bearer Token，请妥善保管。" },
-    "admin_username": { title: "后台账号", desc: "登录 Grok2API 服务管理后台的用户名，默认 admin。" },
-    "app_key": { title: "后台密码", desc: "登录 Grok2API 服务管理后台的密码，请妥善保管。" },
+    "api_key": { title: "API 密钥", desc: "调用 Grok2API 服务的 Token（可选）。" },
+    "app_key": { title: "后台密码", desc: "登录 Grok2API 管理后台的密码（必填）。" },
     "app_url": { title: "应用地址", desc: "当前 Grok2API 服务的外部访问 URL，用于文件链接访问。" },
     "image_format": { title: "图片格式", desc: "生成的图片格式（url 或 base64）。" },
-    "video_format": { title: "视频格式", desc: "生成的视频格式（仅支持 url）。" }
+    "video_format": { title: "视频格式", desc: "生成的视频格式（html 或 url，url 为处理后的链接）。" }
   },
-  "grok": {
-    "label": "Grok 设置",
+  "network": {
+    "label": "网络配置",
+    "timeout": { title: "请求超时", desc: "请求 Grok 服务的超时时间（秒）。" },
+    "base_proxy_url": { title: "基础代理 URL", desc: "代理请求到 Grok 官网的基础服务地址。" },
+    "asset_proxy_url": { title: "资源代理 URL", desc: "代理请求到 Grok 官网的静态资源（图片/视频）地址。" }
+  },
+  "security": {
+    "label": "反爬虫验证",
+    "cf_clearance": { title: "CF Clearance", desc: "Cloudflare Clearance Cookie，用于绕过反爬虫验证。" },
+    "browser": { title: "浏览器指纹", desc: "curl_cffi 浏览器指纹标识（如 chrome136）。" },
+    "user_agent": { title: "User-Agent", desc: "HTTP 请求的 User-Agent 字符串，需与浏览器指纹匹配。" }
+  },
+  "chat": {
+    "label": "对话配置",
     "temporary": { title: "临时对话", desc: "是否启用临时对话模式。" },
+    "disable_memory": { title: "禁用记忆", desc: "禁用 Grok 记忆功能，以防止响应中出现不相关上下文。" },
     "stream": { title: "流式响应", desc: "是否默认启用流式输出。" },
     "thinking": { title: "思维链", desc: "是否启用模型思维链输出。" },
     "dynamic_statsig": { title: "动态指纹", desc: "是否启用动态生成 Statsig 值。" },
-    "filter_tags": { title: "过滤标签", desc: "自动过滤 Grok 响应中的特殊标签。" },
-    "video_poster_preview": { title: "视频海报预览", desc: "启用后会将返回内容中的 <video> 标签替换为带播放按钮的 Poster 预览图；点击预览图会在新标签页打开视频（默认关闭）。" },
-    "timeout": { title: "超时时间", desc: "请求 Grok 服务的超时时间（秒）。" },
-    "base_proxy_url": { title: "基础代理 URL", desc: "代理请求到 Grok 官网的基础服务地址。" },
-    "asset_proxy_url": { title: "资源代理 URL", desc: "代理请求到 Grok 官网的静态资源（图片/视频）地址。" },
-    "cf_clearance": { title: "CF Clearance", desc: "Cloudflare 验证 Cookie，用于验证 Cloudflare 的验证。" },
-    "imagine_auto_age_verify": { title: "Imagine 自动年龄验证", desc: "首次使用某个 Token 生成 imagine 图片时自动调用年龄验证接口。" },
-    "imagine_enable_nsfw": { title: "Imagine 启用 NSFW", desc: "是否在 imagine 生成请求中启用 NSFW（默认开启）。" },
-    "imagine_birth_date": { title: "Imagine 生日参数", desc: "自动年龄验证调用 set-birth-date 时使用的 birthDate 值（ISO 格式）。" },
-    "imagine_max_retries": { title: "Imagine 最大重试", desc: "grok-imagine 新链路在失败时的最大重试次数。" },
-    "imagine_blocked_retry_limit": { title: "Imagine Blocked 重试上限", desc: "检测到 blocked（只有中间图无最终图）时允许的重试次数。" },
-    "max_retry": { title: "最大重试", desc: "请求 Grok 服务失败时的最大重试次数。" },
-    "retry_status_codes": { title: "重试状态码", desc: "触发重试的 HTTP 状态码列表。" }
+    "filter_tags": { title: "过滤标签", desc: "自动过滤 Grok 响应中的特殊标签。" }
+  },
+  "retry": {
+    "label": "重试策略",
+    "max_retry": { title: "最大重试次数", desc: "请求 Grok 服务失败时的最大重试次数。" },
+    "retry_status_codes": { title: "重试状态码", desc: "触发重试的 HTTP 状态码列表。" },
+    "retry_backoff_base": { title: "退避基数", desc: "重试退避的基础延迟（秒）。" },
+    "retry_backoff_factor": { title: "退避倍率", desc: "重试退避的指数放大系数。" },
+    "retry_backoff_max": { title: "退避上限", desc: "单次重试等待的最大延迟（秒）。" },
+    "retry_budget": { title: "退避预算", desc: "单次请求的最大重试总耗时（秒）。" }
+  },
+  "timeout": {
+    "label": "超时配置",
+    "stream_idle_timeout": { title: "流空闲超时", desc: "流式响应空闲超时（秒），超过将断开。" },
+    "video_idle_timeout": { title: "视频空闲超时", desc: "视频生成空闲超时（秒），超过将断开。" }
+  },
+  "image": {
+    "label": "图片生成",
+    "image_ws": { title: "WebSocket 生成", desc: "启用后 /v1/images/generations 走 WebSocket 直连。" },
+    "image_ws_nsfw": { title: "NSFW 模式", desc: "WebSocket 请求是否启用 NSFW。" },
+    "image_ws_blocked_seconds": { title: "Blocked 阈值", desc: "收到中等图后超过该秒数仍无最终图则判定 blocked。" },
+    "image_ws_final_min_bytes": { title: "最终图最小字节", desc: "判定最终图的最小字节数（通常 JPG > 100KB）。" },
+    "image_ws_medium_min_bytes": { title: "中等图最小字节", desc: "判定中等质量图的最小字节数。" }
   },
   "token": {
-    "label": "Token 池设置",
+    "label": "Token 池管理",
     "auto_refresh": { title: "自动刷新", desc: "是否开启 Token 自动刷新机制。" },
-    "refresh_interval_hours": { title: "刷新间隔", desc: "Token 刷新的时间间隔（小时）。" },
-    "fail_threshold": { title: "失败阈值", desc: "单个 Token 连续失败多少次后标记为不可用。" },
+    "refresh_interval_hours": { title: "刷新间隔", desc: "普通 Token 刷新的时间间隔（小时）。" },
+    "super_refresh_interval_hours": { title: "Super 刷新间隔", desc: "Super Token 刷新的时间间隔（小时）。" },
+    "fail_threshold": { title: "失败阈值", desc: "单个 Token 连续失败多少次后被标记为不可用。" },
     "save_delay_ms": { title: "保存延迟", desc: "Token 变更合并写入的延迟（毫秒）。" },
-    "reload_interval_sec": { title: "一致性刷新", desc: "多 worker 场景下 Token 状态刷新间隔（秒）。" }
+    "reload_interval_sec": { title: "同步间隔", desc: "多 worker 场景下 Token 状态刷新间隔（秒）。" }
   },
   "cache": {
-    "label": "缓存设置",
+    "label": "缓存管理",
     "enable_auto_clean": { title: "自动清理", desc: "是否启用缓存自动清理，开启后按上限自动回收。" },
     "limit_mb": { title: "清理阈值", desc: "缓存大小阈值（MB），超过阈值会触发清理。" }
   },
   "performance": {
     "label": "并发性能",
-    "assets_max_concurrent": { title: "资产并发上限", desc: "资源上传/下载/列表的并发上限。推荐 25。" },
-    "media_max_concurrent": { title: "媒体并发上限", desc: "视频/媒体生成请求的并发上限。推荐 50。" },
-    "usage_max_concurrent": { title: "用量并发上限", desc: "用量查询请求的并发上限。推荐 25。" },
-    "assets_delete_batch_size": { title: "资产清理批量", desc: "在线资产删除单批并发数量。推荐 10。" },
-    "admin_assets_batch_size": { title: "管理端批量", desc: "管理端在线资产统计/清理批量并发数量。推荐 10。" }
-  },
-  "register": {
-    "label": "自动注册",
-    "worker_domain": { title: "Worker 域名", desc: "临时邮箱 Worker 的域名（不含 https://）。" },
-    "email_domain": { title: "邮箱域名", desc: "临时邮箱使用的域名，如 example.com。" },
-    "admin_password": { title: "邮箱管理密码", desc: "Worker 后台的管理密钥。" },
-    "yescaptcha_key": { title: "YesCaptcha Key", desc: "可选。填写后优先使用 YesCaptcha。" },
-    "solver_url": { title: "Solver 地址", desc: "本地 Turnstile Solver 地址，默认 http://127.0.0.1:5072。" },
-    "solver_browser_type": { title: "Solver 浏览器", desc: "Solver 使用的浏览器类型：chromium / chrome / msedge / camoufox。建议使用 camoufox（对 accounts.x.ai 成功率更高）。" },
-    "solver_threads": { title: "Solver 线程数", desc: "自动启动 Solver 时的线程数，默认 5。" },
-    "register_threads": { title: "注册线程数", desc: "注册并发线程数，默认 10。" },
-    "default_count": { title: "默认注册数量", desc: "未填写数量时默认注册多少个，默认 100。" },
-    "auto_start_solver": { title: "自动启动 Solver", desc: "注册时自动启动本地 Solver。" },
-    "solver_debug": { title: "Solver 调试", desc: "启动 Solver 时开启调试日志。" },
-    "max_errors": { title: "最大错误数", desc: "失败次数超过阈值会自动停止注册。0 表示自动计算。"},
-    "max_runtime_minutes": { title: "最长运行时间(分钟)", desc: "超过指定分钟数后自动停止注册。0 表示不限制。"}
+    "media_max_concurrent": { title: "Media 并发上限", desc: "视频/媒体生成请求的并发上限。推荐 50。" },
+    "nsfw_max_concurrent": { title: "NSFW 开启并发上限", desc: "批量开启 NSFW 模式时的并发请求上限。推荐 10。" },
+    "nsfw_batch_size": { title: "NSFW 开启批量大小", desc: "批量开启 NSFW 模式的单批处理数量。推荐 50。" },
+    "nsfw_max_tokens": { title: "NSFW 开启最大数量", desc: "单次批量开启 NSFW 的 Token 数量上限，防止误操作。推荐 1000。" },
+    "usage_max_concurrent": { title: "Token 刷新并发上限", desc: "批量刷新 Token 用量时的并发请求上限。推荐 25。" },
+    "usage_batch_size": { title: "Token 刷新批次大小", desc: "批量刷新 Token 用量的单批处理数量。推荐 50。" },
+    "usage_max_tokens": { title: "Token 刷新最大数量", desc: "单次批量刷新 Token 用量时的处理数量上限。推荐 1000。" },
+    "assets_max_concurrent": { title: "Assets 处理并发上限", desc: "批量查找/删除资产时的并发请求上限。推荐 25。" },
+    "assets_batch_size": { title: "Assets 处理批次大小", desc: "批量查找/删除资产时的单批处理数量。推荐 10。" },
+    "assets_max_tokens": { title: "Assets 处理最大数量", desc: "单次批量查找/删除资产时的处理数量上限。推荐 1000。" },
+    "assets_delete_batch_size": { title: "Assets 单账号删除批量大小", desc: "单账号批量删除资产时的单批并发数量。推荐 10。" }
   }
 };
+
+// 配置部分说明（可选）
+const SECTION_DESCRIPTIONS = {
+  "security": "配置不正确将导致 403 错误。服务首次请求 Grok 时的 IP 必须与获取 CF Clearance 时的 IP 一致，后续服务器请求 IP 变化不会导致 403。"
+};
+
+const SECTION_ORDER = new Map(Object.keys(LOCALE_MAP).map((key, index) => [key, index]));
 
 function getText(section, key) {
   if (LOCALE_MAP[section] && LOCALE_MAP[section][key]) {
@@ -101,6 +133,101 @@ function getText(section, key) {
 
 function getSectionLabel(section) {
   return (LOCALE_MAP[section] && LOCALE_MAP[section].label) || `${section} 设置`;
+}
+
+function sortByOrder(keys, orderMap) {
+  if (!orderMap) return keys;
+  return keys.sort((a, b) => {
+    const ia = orderMap.get(a);
+    const ib = orderMap.get(b);
+    if (ia !== undefined && ib !== undefined) return ia - ib;
+    if (ia !== undefined) return -1;
+    if (ib !== undefined) return 1;
+    return 0;
+  });
+}
+
+function setInputMeta(input, section, key) {
+  input.dataset.section = section;
+  input.dataset.key = key;
+}
+
+function createOption(value, text, selectedValue) {
+  const option = document.createElement('option');
+  option.value = value;
+  option.text = text;
+  if (selectedValue !== undefined && selectedValue === value) option.selected = true;
+  return option;
+}
+
+function buildBooleanInput(section, key, val) {
+  const label = document.createElement('label');
+  label.className = 'relative inline-flex items-center cursor-pointer';
+
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = val;
+  input.className = 'sr-only peer';
+  setInputMeta(input, section, key);
+
+  const slider = document.createElement('div');
+  slider.className = "w-9 h-5 bg-[var(--accents-2)] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-black";
+
+  label.appendChild(input);
+  label.appendChild(slider);
+
+  return { input, node: label };
+}
+
+function buildSelectInput(section, key, val, options) {
+  const input = document.createElement('select');
+  input.className = 'geist-input h-[34px]';
+  setInputMeta(input, section, key);
+  options.forEach(opt => {
+    input.appendChild(createOption(opt.val, opt.text, val));
+  });
+  return { input, node: input };
+}
+
+function buildJsonInput(section, key, val) {
+  const input = document.createElement('textarea');
+  input.className = 'geist-input font-mono text-xs';
+  input.rows = 4;
+  input.value = JSON.stringify(val, null, 2);
+  setInputMeta(input, section, key);
+  input.dataset.type = 'json';
+  return { input, node: input };
+}
+
+function buildTextInput(section, key, val) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'geist-input';
+  input.value = val;
+  setInputMeta(input, section, key);
+  return { input, node: input };
+}
+
+function buildSecretInput(section, key, val) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'geist-input flex-1 h-[34px]';
+  input.value = val;
+  setInputMeta(input, section, key);
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'flex items-center gap-2';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'flex-none w-[32px] h-[32px] flex items-center justify-center bg-black text-white rounded-md hover:opacity-80 transition-opacity';
+  copyBtn.type = 'button';
+  copyBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+  copyBtn.onclick = () => copyToClipboard(input.value, copyBtn);
+
+  wrapper.appendChild(input);
+  wrapper.appendChild(copyBtn);
+
+  return { input, node: wrapper };
 }
 
 async function init() {
@@ -126,186 +253,125 @@ async function loadData() {
 }
 
 function renderConfig(data) {
-  const container = document.getElementById('config-container');
-  container.innerHTML = '';
+  const container = byId('config-container');
+  if (!container) return;
+  container.replaceChildren();
 
-  const sections = Object.keys(data);
-  const sectionOrder = Object.keys(LOCALE_MAP);
-
-  sections.sort((a, b) => {
-    const ia = sectionOrder.indexOf(a);
-    const ib = sectionOrder.indexOf(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1; // Known sections first
-    if (ib !== -1) return 1;
-    return 0;
-  });
+  const fragment = document.createDocumentFragment();
+  const sections = sortByOrder(Object.keys(data), SECTION_ORDER);
 
   sections.forEach(section => {
     const items = data[section];
+    const localeSection = LOCALE_MAP[section];
+    const keyOrder = localeSection ? new Map(Object.keys(localeSection).map((k, i) => [k, i])) : null;
 
-    const card = document.createElement('div');
-    card.className = 'config-section';
+    const allKeys = sortByOrder(Object.keys(items), keyOrder);
 
-    const header = document.createElement('div');
-    header.innerHTML = `<div class="config-section-title">${getSectionLabel(section)}</div>`;
-    card.appendChild(header);
+    if (allKeys.length > 0) {
+      const card = document.createElement('div');
+      card.className = 'config-section';
 
-    const grid = document.createElement('div');
-    grid.className = 'config-grid';
+      const header = document.createElement('div');
+      header.innerHTML = `<div class="config-section-title">${getSectionLabel(section)}</div>`;
+      
+      // 添加部分说明（如果有）
+      if (SECTION_DESCRIPTIONS[section]) {
+        const descP = document.createElement('p');
+        descP.className = 'text-[var(--accents-4)] text-sm mt-1 mb-4';
+        descP.textContent = SECTION_DESCRIPTIONS[section];
+        header.appendChild(descP);
+      }
+      
+      card.appendChild(header);
 
-    const keys = Object.keys(items);
-    if (LOCALE_MAP[section]) {
-      const order = Object.keys(LOCALE_MAP[section]);
-      keys.sort((a, b) => {
-        const ia = order.indexOf(a);
-        const ib = order.indexOf(b);
-        if (ia !== -1 && ib !== -1) return ia - ib;
-        if (ia !== -1) return -1;
-        if (ib !== -1) return 1;
-        return 0;
+      const grid = document.createElement('div');
+      grid.className = 'config-grid';
+
+      allKeys.forEach(key => {
+        const fieldCard = buildFieldCard(section, key, items[key]);
+        grid.appendChild(fieldCard);
       });
-    }
 
-    keys.forEach(key => {
-      const val = items[key];
-      const text = getText(section, key);
-
-      // Container
-      const fieldCard = document.createElement('div');
-      fieldCard.className = 'config-field';
-
-      // Title
-      const titleEl = document.createElement('div');
-      titleEl.className = 'config-field-title';
-      titleEl.textContent = text.title;
-      fieldCard.appendChild(titleEl);
-
-      // Description (Muted)
-      const descEl = document.createElement('p');
-      descEl.className = 'config-field-desc';
-      descEl.textContent = text.desc;
-      fieldCard.appendChild(descEl);
-
-      // Input Wrapper
-      const inputWrapper = document.createElement('div');
-      inputWrapper.className = 'config-field-input';
-
-      // Input Logic
-      let input;
-      if (typeof val === 'boolean') {
-        const label = document.createElement('label');
-        label.className = 'relative inline-flex items-center cursor-pointer';
-
-        input = document.createElement('input');
-        input.type = 'checkbox';
-        input.checked = val;
-        input.className = 'sr-only peer';
-        input.dataset.section = section;
-        input.dataset.key = key;
-
-        const slider = document.createElement('div');
-        slider.className = "w-9 h-5 bg-[var(--accents-2)] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-black";
-
-        label.appendChild(input);
-        label.appendChild(slider);
-        inputWrapper.appendChild(label);
+      card.appendChild(grid);
+      if (grid.children.length > 0) {
+        fragment.appendChild(card);
       }
-      else if (key === 'image_format') {
-        input = document.createElement('select');
-        input.className = 'geist-input h-[34px]'; // Matches reduced padding inputs
-        input.dataset.section = section;
-        input.dataset.key = key;
-
-        const opts = [
-          { val: 'url', text: 'URL' },
-          { val: 'base64', text: 'Base64' }
-        ];
-
-        opts.forEach(opt => {
-          const option = document.createElement('option');
-          option.value = opt.val;
-          option.text = opt.text;
-          if (val === opt.val) option.selected = true;
-          input.appendChild(option);
-        });
-        inputWrapper.appendChild(input);
-      }
-      else if (key === 'video_format') {
-        input = document.createElement('select');
-        input.className = 'geist-input h-[34px]';
-        input.dataset.section = section;
-        input.dataset.key = key;
-
-        const option = document.createElement('option');
-        option.value = 'url';
-        option.text = 'URL';
-        option.selected = true;
-        input.appendChild(option);
-
-        inputWrapper.appendChild(input);
-      }
-      else if (Array.isArray(val) || typeof val === 'object') {
-        input = document.createElement('textarea');
-        input.className = 'geist-input font-mono text-xs';
-        input.rows = 4;
-        input.value = JSON.stringify(val, null, 2);
-        input.dataset.section = section;
-        input.dataset.key = key;
-        input.dataset.type = 'json';
-        inputWrapper.appendChild(input);
-      }
-      else {
-        input = document.createElement('input');
-        input.type = 'text';
-        input.className = 'geist-input';
-        input.value = val;
-        input.dataset.section = section;
-        input.dataset.key = key;
-
-        if (key === 'app_key') input.type = 'text';
-
-        if (key === 'api_key' || key === 'app_key') {
-          const wrapper = document.createElement('div');
-          wrapper.className = 'flex items-center gap-2';
-
-          input.className = 'geist-input flex-1 h-[34px]';
-
-          const copyBtn = document.createElement('button');
-          copyBtn.className = 'flex-none w-[32px] h-[32px] flex items-center justify-center bg-black text-white rounded-md hover:opacity-80 transition-opacity';
-          copyBtn.type = 'button';
-          copyBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
-
-          copyBtn.onclick = () => copyToClipboard(input.value, copyBtn);
-
-          wrapper.appendChild(input);
-          wrapper.appendChild(copyBtn);
-          inputWrapper.appendChild(wrapper);
-        } else {
-          inputWrapper.appendChild(input);
-        }
-      }
-
-      fieldCard.appendChild(inputWrapper);
-      grid.appendChild(fieldCard);
-    });
-
-    card.appendChild(grid);
-
-    if (grid.children.length > 0) {
-      container.appendChild(card);
     }
   });
+
+  container.appendChild(fragment);
+}
+
+function buildFieldCard(section, key, val) {
+  const text = getText(section, key);
+
+  const fieldCard = document.createElement('div');
+  fieldCard.className = 'config-field';
+
+  // Title
+  const titleEl = document.createElement('div');
+  titleEl.className = 'config-field-title';
+  titleEl.textContent = text.title;
+  fieldCard.appendChild(titleEl);
+
+  // Description (Muted) - 只在有描述时显示
+  if (text.desc) {
+    const descEl = document.createElement('p');
+    descEl.className = 'config-field-desc';
+    descEl.textContent = text.desc;
+    fieldCard.appendChild(descEl);
+  }
+
+  // Input Wrapper
+  const inputWrapper = document.createElement('div');
+  inputWrapper.className = 'config-field-input';
+
+  // Input Logic
+  let built;
+  if (typeof val === 'boolean') {
+    built = buildBooleanInput(section, key, val);
+  }
+  else if (key === 'image_format') {
+    built = buildSelectInput(section, key, val, [
+      { val: 'url', text: 'URL' },
+      { val: 'base64', text: 'Base64' }
+    ]);
+  }
+  else if (key === 'video_format') {
+    built = buildSelectInput(section, key, val, [
+      { val: 'html', text: 'HTML' },
+      { val: 'url', text: 'URL' }
+    ]);
+  }
+  else if (Array.isArray(val) || typeof val === 'object') {
+    built = buildJsonInput(section, key, val);
+  }
+  else {
+    if (key === 'api_key' || key === 'app_key') {
+      built = buildSecretInput(section, key, val);
+    } else {
+      built = buildTextInput(section, key, val);
+    }
+  }
+
+  if (built) {
+    inputWrapper.appendChild(built.node);
+  }
+  fieldCard.appendChild(inputWrapper);
+
+  return fieldCard;
 }
 
 async function saveConfig() {
-  const btn = document.getElementById('save-btn');
+  const btn = byId('save-btn');
   const originalText = btn.innerText;
   btn.disabled = true;
   btn.innerText = '保存中...';
 
   try {
-    const newConfig = JSON.parse(JSON.stringify(currentConfig));
+    const newConfig = typeof structuredClone === 'function'
+      ? structuredClone(currentConfig)
+      : JSON.parse(JSON.stringify(currentConfig));
     const inputs = document.querySelectorAll('input[data-section], textarea[data-section], select[data-section]');
 
     inputs.forEach(input => {
@@ -320,7 +386,7 @@ async function saveConfig() {
       } else if (k === 'admin_username' && val.trim() === '') {
         throw new Error('后台账号不能为空');
       } else if (k === 'app_key' && val.trim() === '') {
-        throw new Error('后台密码不能为空');
+        throw new Error('app_key 不能为空（后台密码）');
       } else if (NUMERIC_FIELDS.has(k)) {
         if (val.trim() !== '' && !Number.isNaN(Number(val))) {
           val = Number(val);

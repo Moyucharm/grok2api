@@ -9,7 +9,7 @@ from typing import Optional, Dict
 from app.core.config import get_config
 from app.core.exceptions import AppException, ErrorType
 from app.services.api_keys import api_key_manager
-from app.services.grok.model import ModelService
+from app.services.grok.models.model import ModelService
 
 
 async def enforce_daily_quota(

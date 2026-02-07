@@ -257,8 +257,8 @@ async function refreshModels() {
     });
 
     if (currentTab === 'image') {
-      if (filtered.some((m) => String(m.id || '') === 'grok-imagine')) sel.value = 'grok-imagine';
-      else if (filtered.some((m) => String(m.id || '') === 'grok-imagine-1.0')) sel.value = 'grok-imagine-1.0';
+      if (filtered.some((m) => String(m.id || '') === 'grok-imagine-1.0')) sel.value = 'grok-imagine-1.0';
+      else if (filtered.length > 0) sel.value = String(filtered[0].id || '');
     }
     else if (currentTab === 'video') {
       if (filtered.some((m) => String(m.id || '') === 'grok-imagine-video')) sel.value = 'grok-imagine-video';
@@ -412,7 +412,7 @@ async function streamChat(body, bubbleEl) {
 async function generateImage() {
   const prompt = String(q('image-prompt').value || '').trim();
   if (!prompt) return showToast('请输入 prompt', 'warning');
-  const model = String(q('model-select').value || 'grok-imagine').trim();
+  const model = String(q('model-select').value || 'grok-imagine-1.0').trim();
   const n = Math.max(1, Math.min(10, Math.floor(Number(q('image-n').value || 1) || 1)));
 
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };

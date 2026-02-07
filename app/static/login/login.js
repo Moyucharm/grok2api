@@ -1,53 +1,62 @@
 const usernameInput = document.getElementById('username-input');
 const passwordInput = document.getElementById('password-input');
+const apiKeyInput = document.getElementById('api-key-input');
 
-usernameInput.addEventListener('keypress', function (e) {
-  if (e.key === 'Enter') passwordInput.focus();
-});
+function buildCreds() {
+  if (passwordInput) {
+    const username = (usernameInput ? usernameInput.value : '').trim() || 'admin';
+    const password = passwordInput.value.trim();
+    return { username, password };
+  }
 
-passwordInput.addEventListener('keypress', function (e) {
-  if (e.key === 'Enter') login();
-});
+  const password = (apiKeyInput ? apiKeyInput.value : '').trim();
+  return { username: 'admin', password };
+}
+
+async function requestLogin(creds) {
+  const res = await fetch('/api/v1/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(creds),
+  });
+  return res.ok;
+}
+
+function bindEnter(el) {
+  if (!el) return;
+  el.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') login();
+  });
+}
+
+bindEnter(usernameInput);
+bindEnter(passwordInput);
+bindEnter(apiKeyInput);
 
 async function login() {
-  const username = (usernameInput.value || '').trim();
-  const password = (passwordInput.value || '').trim();
-  if (!username || !password) return;
+  const creds = buildCreds();
+  if (!creds.password) return;
 
   try {
-    const res = await fetch('/api/v1/admin/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-
-    if (res.ok) {
-      await storeAppKey({ username, password });
+    const ok = await requestLogin(creds);
+    if (ok) {
+      await storeAppKey(creds);
       window.location.href = '/admin/token';
     } else {
-      showToast('用户名或密码错误', 'error');
+      showToast('Invalid username or password', 'error');
     }
   } catch (e) {
-    showToast('连接失败', 'error');
+    showToast('Connection failed', 'error');
   }
 }
 
-// Auto-redirect checks
 (async () => {
-  const existing = await getStoredAppKey();
-  const existingUsername = (existing && existing.username) ? String(existing.username) : '';
-  const existingPassword = (existing && existing.password) ? String(existing.password) : '';
-
-  usernameInput.value = existingUsername || 'admin';
-  passwordInput.focus();
-
-  if (!existingPassword) return;
-
-  fetch('/api/v1/admin/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: usernameInput.value.trim(), password: existingPassword })
-  }).then(res => {
-    if (res.ok) window.location.href = '/admin/token';
-  });
+  const existingCreds = await getStoredAppKey();
+  if (!existingCreds || !existingCreds.password) return;
+  try {
+    const ok = await requestLogin(existingCreds);
+    if (ok) window.location.href = '/admin/token';
+  } catch (e) {
+    return;
+  }
 })();
