@@ -148,10 +148,12 @@ interface BatchTaskState {
   error?: string;
   result?: Record<string, unknown>;
   createdAt: number;
+  updatedAt: number;
 }
 
 const batchTasks = new Map<string, BatchTaskState>();
 const BATCH_TASK_TTL_MS = 30 * 60 * 1000;
+const BATCH_TASK_STALE_MS = 3 * 60 * 1000;
 
 interface AutoRegisterJobState {
   id: string;
@@ -256,6 +258,7 @@ function cleanupBatchTasks(): void {
 
 function createBatchTask(type: BatchTaskType, total: number): BatchTaskState {
   cleanupBatchTasks();
+  const now = nowMs();
   const task: BatchTaskState = {
     id: crypto.randomUUID(),
     type,
@@ -263,10 +266,15 @@ function createBatchTask(type: BatchTaskType, total: number): BatchTaskState {
     processed: 0,
     cancelled: false,
     done: false,
-    createdAt: nowMs(),
+    createdAt: now,
+    updatedAt: now,
   };
   batchTasks.set(task.id, task);
   return task;
+}
+
+function touchBatchTask(task: BatchTaskState): void {
+  task.updatedAt = nowMs();
 }
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
@@ -391,6 +399,7 @@ async function runCacheLoadBatchTask(env: Env, task: BatchTaskState, rawTokens: 
       last_asset_clear_at: null,
     });
     task.processed += 1;
+    touchBatchTask(task);
     await sleep(20);
   }
 
@@ -411,6 +420,7 @@ async function runCacheLoadBatchTask(env: Env, task: BatchTaskState, rawTokens: 
     online_details: details,
   };
   task.done = true;
+  touchBatchTask(task);
 }
 
 async function runCacheClearBatchTask(task: BatchTaskState, rawTokens: string[]): Promise<void> {
@@ -423,6 +433,7 @@ async function runCacheClearBatchTask(task: BatchTaskState, rawTokens: string[])
       error: "Online assets clear is not supported on Cloudflare Workers runtime.",
     };
     task.processed += 1;
+    touchBatchTask(task);
     await sleep(20);
   }
 
@@ -436,6 +447,7 @@ async function runCacheClearBatchTask(task: BatchTaskState, rawTokens: string[])
     },
   };
   task.done = true;
+  touchBatchTask(task);
 }
 
 async function runRefreshBatchTask(
@@ -502,6 +514,7 @@ async function runRefreshBatchTask(
     }
 
     task.processed += 1;
+    touchBatchTask(task);
     await sleep(50);
   }
 
@@ -516,6 +529,7 @@ async function runRefreshBatchTask(
     },
   };
   task.done = true;
+  touchBatchTask(task);
 }
 
 async function runNsfwBatchTask(
@@ -526,24 +540,29 @@ async function runNsfwBatchTask(
   const settings = await getSettings(env);
   const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
   const birthDate = ensureBirthDate(String(settings.grok.imagine_birth_date ?? ""));
+  const perf = settings as unknown as { performance?: { nsfw_max_concurrent?: number } };
+  const rawConcurrency = Number(perf.performance?.nsfw_max_concurrent ?? 3);
+  const concurrency = Number.isFinite(rawConcurrency) ? Math.max(1, Math.min(8, Math.floor(rawConcurrency))) : 3;
 
   const rows = await listTokens(env.DB);
   const byToken = new Map(rows.map((r) => [r.token, r]));
 
   const unique = [...new Set(tokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
-  const itemResults: Array<{ token: string; ok: boolean; message?: string }> = [];
+  const resultsByToken = new Map<string, { token: string; ok: boolean; message?: string }>();
   let okCount = 0;
   let failCount = 0;
+  touchBatchTask(task);
 
-  for (const token of unique) {
+  const processOne = async (token: string): Promise<void> => {
     if (task.cancelled) return;
 
     const row = byToken.get(token);
     if (!row) {
-      itemResults.push({ token: `sso=${token}`, ok: false, message: "Token not found" });
+      resultsByToken.set(token, { token: `sso=${token}`, ok: false, message: "Token not found" });
       failCount += 1;
       task.processed += 1;
-      continue;
+      touchBatchTask(task);
+      return;
     }
 
     let ok = false;
@@ -576,7 +595,7 @@ async function runNsfwBatchTask(
 
     if (ok) {
       okCount += 1;
-      itemResults.push({ token: `sso=${token}`, ok: true });
+      resultsByToken.set(token, { token: `sso=${token}`, ok: true });
     } else {
       try {
         const currentTags = parseTokenTags(row.tags);
@@ -591,10 +610,35 @@ async function runNsfwBatchTask(
         // keep original failure as source of truth
       }
       failCount += 1;
-      itemResults.push({ token: `sso=${token}`, ok: false, ...(message ? { message } : {}) });
+      resultsByToken.set(token, { token: `sso=${token}`, ok: false, ...(message ? { message } : {}) });
     }
     task.processed += 1;
-    await sleep(80);
+    touchBatchTask(task);
+  };
+
+  let cursor = 0;
+  const workerCount = Math.min(concurrency, unique.length || 1);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      if (task.cancelled) return;
+      const index = cursor;
+      cursor += 1;
+      const token = unique[index];
+      if (!token) return;
+      await processOne(token);
+    }
+  });
+  await Promise.all(workers);
+  if (task.cancelled) return;
+
+  const itemResults: Array<{ token: string; ok: boolean; message?: string }> = unique.map((token) => {
+    const item = resultsByToken.get(token);
+    if (item) return item;
+    return { token: `sso=${token}`, ok: false, message: "Task interrupted before completion" };
+  });
+  for (const item of itemResults) {
+    if (item.ok) continue;
+    if (!item.message) item.message = "Unknown failure";
   }
 
   task.result = {
@@ -612,6 +656,7 @@ async function runNsfwBatchTask(
       : `NSFW enabling failed for ${failCount} token(s).`;
   }
   task.done = true;
+  touchBatchTask(task);
 }
 
 adminRoutes.post("/api/v1/admin/login", async (c) => {
@@ -662,6 +707,7 @@ adminRoutes.get("/api/v1/admin/batch/:taskId", requireAdminAuth, async (c) => {
       processed: task.processed,
       cancelled: task.cancelled,
       done: task.done,
+      updated_at: task.updatedAt,
       ...(task.warning ? { warning: task.warning } : {}),
       ...(task.error ? { error: task.error } : {}),
       ...(task.result ? { result: task.result } : {}),
@@ -697,6 +743,11 @@ adminRoutes.get("/api/v1/admin/batch/:taskId/stream", async (c) => {
             if (timer !== null) clearInterval(timer);
             controller.close();
             return;
+          }
+
+          if (!t.done && !t.cancelled && !t.error && nowMs() - t.updatedAt > BATCH_TASK_STALE_MS) {
+            t.error = "Task stalled in Workers runtime (likely background execution timeout).";
+            touchBatchTask(t);
           }
 
           send({ type: "progress", total: t.total, processed: t.processed });
@@ -752,6 +803,7 @@ adminRoutes.post("/api/v1/admin/batch/:taskId/cancel", requireAdminAuth, async (
   const task = batchTasks.get(taskId);
   if (!task) return c.json(legacyErr("Task not found"), 404);
   task.cancelled = true;
+  touchBatchTask(task);
   return c.json(legacyOk({ task_id: taskId, cancelled: true }));
 });
 
@@ -1311,6 +1363,7 @@ adminRoutes.post("/api/v1/admin/tokens/refresh/async", requireAdminAuth, async (
           await runRefreshBatchTask(c.env, task, unique);
         } catch (e) {
           task.error = e instanceof Error ? e.message : String(e);
+          touchBatchTask(task);
         }
       })(),
     );
@@ -1337,6 +1390,7 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/enable/async", requireAdminAuth, asy
           await runNsfwBatchTask(c.env, task, unique);
         } catch (e) {
           task.error = e instanceof Error ? e.message : String(e);
+          touchBatchTask(task);
         }
       })(),
     );
@@ -1429,6 +1483,7 @@ adminRoutes.post("/api/v1/admin/cache/online/load/async", requireAdminAuth, asyn
           await runCacheLoadBatchTask(c.env, task, tokens);
         } catch (e) {
           task.error = e instanceof Error ? e.message : String(e);
+          touchBatchTask(task);
         }
       })(),
     );
@@ -1454,6 +1509,7 @@ adminRoutes.post("/api/v1/admin/cache/online/clear/async", requireAdminAuth, asy
           await runCacheClearBatchTask(task, tokens);
         } catch (e) {
           task.error = e instanceof Error ? e.message : String(e);
+          touchBatchTask(task);
         }
       })(),
     );
