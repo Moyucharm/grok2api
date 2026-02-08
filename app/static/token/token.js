@@ -69,6 +69,39 @@ async function readJsonResponse(res) {
   }
 }
 
+async function fetchBatchTaskState(taskId) {
+  if (!taskId) return null;
+  try {
+    const res = await fetch(`/api/v1/admin/batch/${encodeURIComponent(taskId)}`, {
+      headers: buildAuthHeaders(apiKey)
+    });
+    const data = await readJsonResponse(res);
+    if (!res.ok || !data || data.status !== 'success') return null;
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+function closeBatchStream() {
+  BatchSSE.close(batchEventSource);
+  batchEventSource = null;
+}
+
+function buildNsfwFailureText(result) {
+  if (!result || !Array.isArray(result.items)) return '';
+  const failedItems = result.items.filter(item => item && item.ok === false);
+  if (!failedItems.length) return '';
+  const first = failedItems[0];
+  const firstToken = first && first.token ? String(first.token) : '';
+  const firstMsg = first && first.message ? String(first.message) : 'unknown error';
+  let text = `\n失败示例: ${firstToken || '(unknown token)'} -> ${firstMsg}`;
+  if (failedItems.length > 1) {
+    text += `\n其余失败 ${failedItems.length - 1} 个请查看批量任务详情`;
+  }
+  return text;
+}
+
 function getSelectedTokens() {
   return flatTokens.filter(t => t._selected);
 }
@@ -1080,9 +1113,11 @@ async function startBatchRefresh() {
     }
 
     currentBatchTaskId = data.task_id;
-    BatchSSE.close(batchEventSource);
+    let streamErrorCount = 0;
+    closeBatchStream();
     batchEventSource = BatchSSE.open(currentBatchTaskId, apiKey, {
       onMessage: (msg) => {
+        streamErrorCount = 0;
         if (msg.type === 'snapshot' || msg.type === 'progress') {
           if (typeof msg.total === 'number') batchTotal = msg.total;
           if (typeof msg.processed === 'number') batchProcessed = msg.processed;
@@ -1098,28 +1133,71 @@ async function startBatchRefresh() {
             showToast('刷新完成', 'success');
           }
           currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
+          closeBatchStream();
         } else if (msg.type === 'cancelled') {
           finishBatchProcess(true, { silent: true });
           showToast('已终止刷新', 'info');
           currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
+          closeBatchStream();
         } else if (msg.type === 'error') {
           finishBatchProcess(true, { silent: true });
           showToast('刷新失败: ' + (msg.error || '未知错误'), 'error');
           currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
+          closeBatchStream();
         }
       },
-      onError: () => {
+      onError: async () => {
+        if (!isBatchProcessing || !currentBatchTaskId) return;
+        streamErrorCount += 1;
+        const snapshot = await fetchBatchTaskState(currentBatchTaskId);
+        if (snapshot) {
+          streamErrorCount = 0;
+          if (typeof snapshot.total === 'number') batchTotal = snapshot.total;
+          if (typeof snapshot.processed === 'number') batchProcessed = snapshot.processed;
+          updateBatchProgress();
+
+          if (snapshot.done) {
+            batchProcessed = batchTotal;
+            updateBatchProgress();
+            finishBatchProcess(false, { silent: true });
+            if (snapshot.warning) {
+              showToast(`刷新完成\n⚠️ ${snapshot.warning}`, 'warning');
+            } else {
+              showToast('刷新完成', 'success');
+            }
+            currentBatchTaskId = null;
+            closeBatchStream();
+            return;
+          }
+
+          if (snapshot.cancelled) {
+            finishBatchProcess(true, { silent: true });
+            showToast('已终止刷新', 'info');
+            currentBatchTaskId = null;
+            closeBatchStream();
+            return;
+          }
+
+          if (snapshot.error) {
+            finishBatchProcess(true, { silent: true });
+            showToast('刷新失败: ' + snapshot.error, 'error');
+            currentBatchTaskId = null;
+            closeBatchStream();
+            return;
+          }
+
+          // Task still running; let EventSource auto-reconnect.
+          return;
+        }
+
+        if (streamErrorCount < 3) {
+          // Transient stream error; allow browser to retry.
+          return;
+        }
         finishBatchProcess(true, { silent: true });
         showToast('连接中断', 'error');
         currentBatchTaskId = null;
-        BatchSSE.close(batchEventSource);
-        batchEventSource = null;
+        closeBatchStream();
       }
     });
   } catch (e) {
@@ -1454,9 +1532,11 @@ async function batchEnableNSFW() {
     }
 
     currentBatchTaskId = data.task_id;
-    BatchSSE.close(batchEventSource);
+    let streamErrorCount = 0;
+    closeBatchStream();
     batchEventSource = BatchSSE.open(currentBatchTaskId, apiKey, {
       onMessage: (msg) => {
+        streamErrorCount = 0;
         if (msg.type === 'snapshot' || msg.type === 'progress') {
           if (typeof msg.total === 'number') batchTotal = msg.total;
           if (typeof msg.processed === 'number') batchProcessed = msg.processed;
@@ -1471,36 +1551,88 @@ async function batchEnableNSFW() {
           const failCount = summary ? summary.fail : 0;
           let text = `NSFW 开启完成：成功 ${okCount}，失败 ${failCount}`;
           if (msg.warning) text += `\n⚠️ ${msg.warning}`;
+          text += buildNsfwFailureText(msg.result);
           showToast(text, failCount > 0 || msg.warning ? 'warning' : 'success');
           currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
+          closeBatchStream();
           if (btn) btn.disabled = false;
           setActionButtonsState();
         } else if (msg.type === 'cancelled') {
           finishBatchProcess(true, { silent: true });
           showToast('已终止 NSFW', 'info');
           currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
+          closeBatchStream();
           if (btn) btn.disabled = false;
           setActionButtonsState();
         } else if (msg.type === 'error') {
           finishBatchProcess(true, { silent: true });
           showToast('开启失败: ' + (msg.error || '未知错误'), 'error');
           currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
+          closeBatchStream();
           if (btn) btn.disabled = false;
           setActionButtonsState();
         }
       },
-      onError: () => {
+      onError: async () => {
+        if (!isBatchProcessing || !currentBatchTaskId) return;
+        streamErrorCount += 1;
+        const snapshot = await fetchBatchTaskState(currentBatchTaskId);
+        if (snapshot) {
+          streamErrorCount = 0;
+          if (typeof snapshot.total === 'number') batchTotal = snapshot.total;
+          if (typeof snapshot.processed === 'number') batchProcessed = snapshot.processed;
+          updateBatchProgress();
+
+          if (snapshot.done) {
+            batchProcessed = batchTotal;
+            updateBatchProgress();
+            finishBatchProcess(false, { silent: true });
+            const summary = snapshot.result && snapshot.result.summary ? snapshot.result.summary : null;
+            const okCount = summary ? summary.ok : 0;
+            const failCount = summary ? summary.fail : 0;
+            let text = `NSFW 开启完成：成功 ${okCount}，失败 ${failCount}`;
+            if (snapshot.warning) text += `\n⚠️ ${snapshot.warning}`;
+            text += buildNsfwFailureText(snapshot.result);
+            showToast(text, failCount > 0 || snapshot.warning ? 'warning' : 'success');
+            currentBatchTaskId = null;
+            closeBatchStream();
+            if (btn) btn.disabled = false;
+            setActionButtonsState();
+            return;
+          }
+
+          if (snapshot.cancelled) {
+            finishBatchProcess(true, { silent: true });
+            showToast('已终止 NSFW', 'info');
+            currentBatchTaskId = null;
+            closeBatchStream();
+            if (btn) btn.disabled = false;
+            setActionButtonsState();
+            return;
+          }
+
+          if (snapshot.error) {
+            finishBatchProcess(true, { silent: true });
+            showToast('开启失败: ' + snapshot.error, 'error');
+            currentBatchTaskId = null;
+            closeBatchStream();
+            if (btn) btn.disabled = false;
+            setActionButtonsState();
+            return;
+          }
+
+          // Task still running; let EventSource auto-reconnect.
+          return;
+        }
+
+        if (streamErrorCount < 3) {
+          // Transient stream error; allow browser to retry.
+          return;
+        }
         finishBatchProcess(true, { silent: true });
         showToast('连接中断', 'error');
         currentBatchTaskId = null;
-        BatchSSE.close(batchEventSource);
-        batchEventSource = null;
+        closeBatchStream();
         if (btn) btn.disabled = false;
         setActionButtonsState();
       }

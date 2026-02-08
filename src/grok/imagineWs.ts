@@ -111,7 +111,34 @@ export interface ImagineAgeVerifyArgs {
   timeoutMs?: number;
 }
 
-export async function verifyImagineAge(args: ImagineAgeVerifyArgs): Promise<boolean> {
+export interface ImagineAgeVerifyResult {
+  ok: boolean;
+  httpStatus: number;
+  reason: string;
+  responseText: string;
+}
+
+function isAgeAlreadyAccepted(status: number, text: string): boolean {
+  if (![400, 409, 422].includes(status)) return false;
+  const low = text.toLowerCase();
+  return (
+    low.includes("already") ||
+    low.includes("birth date") ||
+    low.includes("cannot be changed") ||
+    low.includes("already set") ||
+    low.includes("already verified") ||
+    low.includes("date of birth") ||
+    low.includes("immutable") ||
+    text.includes("\u5df2\u8bbe\u7f6e") ||
+    text.includes("\u5df2\u7ecf\u8bbe\u7f6e") ||
+    text.includes("\u5df2\u9a8c\u8bc1") ||
+    text.includes("\u4e0d\u80fd\u66f4\u6539") ||
+    text.includes("\u4e0d\u53ef\u66f4\u6539") ||
+    text.includes("\u65e0\u6cd5\u66f4\u6539")
+  );
+}
+
+export async function verifyImagineAgeDetailed(args: ImagineAgeVerifyArgs): Promise<ImagineAgeVerifyResult> {
   const timeoutMs = Math.max(5_000, Math.floor(args.timeoutMs ?? 20_000));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -120,8 +147,9 @@ export async function verifyImagineAge(args: ImagineAgeVerifyArgs): Promise<bool
       method: "POST",
       headers: {
         Origin: "https://grok.com",
-        Referer: "https://grok.com/",
+        Referer: "https://grok.com/?_s=account",
         Accept: "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         Cookie: args.cookie,
         "Content-Type": "application/json",
         "User-Agent":
@@ -130,26 +158,37 @@ export async function verifyImagineAge(args: ImagineAgeVerifyArgs): Promise<bool
       body: JSON.stringify({ birthDate: args.birthDate }),
       signal: controller.signal,
     });
-    if (resp.ok) return true;
-
     const txt = await resp.text().catch(() => "");
-    const low = txt.toLowerCase();
-    if ([400, 409, 422].includes(resp.status)) {
-      if (
-        low.includes("already") ||
-        low.includes("birth date") ||
-        low.includes("cannot be changed") ||
-        low.includes("already set")
-      ) {
-        return true;
-      }
+    const snippet = txt.slice(0, 200);
+    if (resp.ok) {
+      return { ok: true, httpStatus: resp.status, reason: "ok", responseText: snippet };
     }
-    return false;
-  } catch {
-    return false;
+
+    if (isAgeAlreadyAccepted(resp.status, txt)) {
+      return {
+        ok: true,
+        httpStatus: resp.status,
+        reason: "already_set_or_verified",
+        responseText: snippet,
+      };
+    }
+    return {
+      ok: false,
+      httpStatus: resp.status,
+      reason: `HTTP ${resp.status}`,
+      responseText: snippet,
+    };
+  } catch (e) {
+    const msg = (e instanceof Error ? e.message : String(e)).slice(0, 200);
+    return { ok: false, httpStatus: 0, reason: msg || "network_error", responseText: "" };
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function verifyImagineAge(args: ImagineAgeVerifyArgs): Promise<boolean> {
+  const result = await verifyImagineAgeDetailed(args);
+  return result.ok;
 }
 
 export async function generateImagineViaWs(args: ImagineWsGenerateArgs): Promise<ImagineWsGenerateResult> {
@@ -349,3 +388,4 @@ export async function generateImagineViaWs(args: ImagineWsGenerateArgs): Promise
     b64List: selected.map((it) => it.blob),
   };
 }
+

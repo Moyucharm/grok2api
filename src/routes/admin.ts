@@ -32,7 +32,8 @@ import {
   updateTokenLimits,
 } from "../repo/tokens";
 import { checkRateLimits } from "../grok/rateLimits";
-import { generateImagineViaWs, ImagineWsError, verifyImagineAge } from "../grok/imagineWs";
+import { generateImagineViaWs, ImagineWsError, verifyImagineAge, verifyImagineAgeDetailed } from "../grok/imagineWs";
+import { enableNsfwFeature } from "../grok/nsfw";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
 import {
@@ -464,7 +465,6 @@ async function runRefreshBatchTask(
     if (task.cancelled) return;
 
     let refreshed = false;
-    let usageSynced = false;
     try {
       const cookie = buildGrokCookie(t, cf);
       const tokenType = tokenTypeByToken.get(t) ?? "sso";
@@ -482,26 +482,18 @@ async function runRefreshBatchTask(
           ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
         });
         await markTokenRecovered(env.DB, t);
-        usageSynced = true;
         refreshed = true;
       }
 
       if (syncAge) {
-        let ageSynced = false;
         try {
           const ageOk = await verifyImagineAge({ cookie, birthDate, timeoutMs: 15_000 });
           if (ageOk) {
             await setTokenAgeVerified(env.DB, t, true);
-            ageSynced = true;
             refreshed = true;
           }
         } catch {
           // ignore age sync failures during refresh
-        }
-        if (!ageSynced && usageSynced) {
-          // Workers mode fallback: token is live even if age endpoint sync is unavailable.
-          await setTokenAgeVerified(env.DB, t, true);
-          refreshed = true;
         }
       }
       results[`sso=${t}`] = refreshed;
@@ -558,15 +550,25 @@ async function runNsfwBatchTask(
     let message = "";
     try {
       const cookie = buildGrokCookie(token, cf);
-      const verified = await verifyImagineAge({ cookie, birthDate, timeoutMs: 20_000 });
-      if (!verified) {
-        message = "Age verify failed";
+      const age = await verifyImagineAgeDetailed({ cookie, birthDate, timeoutMs: 20_000 });
+      if (!age.ok) {
+        const detail = [age.reason, age.responseText].filter(Boolean).join(" ").slice(0, 200);
+        message = detail ? `Age verify failed: ${detail}` : "Age verify failed";
       } else {
-        await setTokenAgeVerified(env.DB, token, true);
-        const tags = parseTokenTags(row.tags);
-        if (!tags.includes("nsfw")) tags.push("nsfw");
-        await updateTokenTags(env.DB, token, row.token_type, tags);
-        ok = true;
+        const nsfw = await enableNsfwFeature({ cookie, timeoutMs: 20_000 });
+        if (!nsfw.success) {
+          message =
+            nsfw.error ??
+            `NSFW enable failed: HTTP ${nsfw.httpStatus}${
+              nsfw.grpcStatus !== null ? `, gRPC ${nsfw.grpcStatus}` : ""
+            }`;
+        } else {
+          await setTokenAgeVerified(env.DB, token, true);
+          const tags = parseTokenTags(row.tags);
+          if (!tags.includes("nsfw")) tags.push("nsfw");
+          await updateTokenTags(env.DB, token, row.token_type, tags);
+          ok = true;
+        }
       }
     } catch (e) {
       message = e instanceof Error ? e.message : String(e);
@@ -576,6 +578,18 @@ async function runNsfwBatchTask(
       okCount += 1;
       itemResults.push({ token: `sso=${token}`, ok: true });
     } else {
+      try {
+        const currentTags = parseTokenTags(row.tags);
+        if (currentTags.includes("nsfw")) {
+          const cleanedTags = currentTags.filter((t) => t !== "nsfw");
+          await updateTokenTags(env.DB, token, row.token_type, cleanedTags);
+        }
+        if (message.startsWith("Age verify failed")) {
+          await setTokenAgeVerified(env.DB, token, false);
+        }
+      } catch {
+        // keep original failure as source of truth
+      }
       failCount += 1;
       itemResults.push({ token: `sso=${token}`, ok: false, ...(message ? { message } : {}) });
     }
@@ -592,7 +606,10 @@ async function runNsfwBatchTask(
     items: itemResults,
   };
   if (failCount > 0) {
-    task.warning = `NSFW enabling failed for ${failCount} token(s).`;
+    const firstFail = itemResults.find((x) => !x.ok && x.message)?.message ?? "";
+    task.warning = firstFail
+      ? `NSFW enabling failed for ${failCount} token(s). First error: ${firstFail}`
+      : `NSFW enabling failed for ${failCount} token(s).`;
   }
   task.done = true;
 }
@@ -631,6 +648,25 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
   } catch (e) {
     return c.json(legacyErr(`Login error: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
+});
+
+adminRoutes.get("/api/v1/admin/batch/:taskId", requireAdminAuth, async (c) => {
+  const taskId = c.req.param("taskId");
+  const task = batchTasks.get(taskId);
+  if (!task) return c.json(legacyErr("Task not found"), 404);
+  return c.json(
+    legacyOk({
+      task_id: task.id,
+      type: task.type,
+      total: task.total,
+      processed: task.processed,
+      cancelled: task.cancelled,
+      done: task.done,
+      ...(task.warning ? { warning: task.warning } : {}),
+      ...(task.error ? { error: task.error } : {}),
+      ...(task.result ? { result: task.result } : {}),
+    }),
+  );
 });
 
 adminRoutes.get("/api/v1/admin/batch/:taskId/stream", async (c) => {
@@ -1092,13 +1128,16 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
       const status = r.status === "expired" ? "invalid" : isCooling ? "cooling" : "active";
       const quotaRaw = r.remaining_queries;
       const quota = quotaRaw >= 0 ? quotaRaw : 0;
+      const tags = parseTokenTags(r.tags);
+      const hasNsfwTag = tags.includes("nsfw");
       const ageVerified = Number(r.age_verified ?? 0) > 0;
       const ageStatus = ageVerified ? "verified" : "unknown";
-      const nsfwStatus = nsfwRequestEnabled ? (ageVerified ? "enabled" : "unknown") : "disabled_by_config";
+      const nsfwStatus = nsfwRequestEnabled ? (hasNsfwTag ? "enabled" : "unknown") : "disabled_by_config";
       out[pool].push({
         token: `sso=${r.token}`,
         status,
         quota,
+        tags,
         note: r.note ?? "",
         fail_count: r.failed_count ?? 0,
         use_count: 0,
@@ -1209,7 +1248,6 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     const results: Record<string, boolean> = {};
     for (const t of unique) {
       let refreshed = false;
-      let usageSynced = false;
       try {
         const cookie = cf ? `sso-rw=${t};sso=${t};${cf}` : `sso-rw=${t};sso=${t}`;
         const tokenType = tokenTypeByToken.get(t) ?? "sso";
@@ -1227,26 +1265,18 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
             ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
           });
           await markTokenRecovered(c.env.DB, t);
-          usageSynced = true;
           refreshed = true;
         }
 
         if (syncAge) {
-          let ageSynced = false;
           try {
             const ageOk = await verifyImagineAge({ cookie, birthDate, timeoutMs: 15_000 });
             if (ageOk) {
               await setTokenAgeVerified(c.env.DB, t, true);
-              ageSynced = true;
               refreshed = true;
             }
           } catch {
             // ignore age sync failures during refresh
-          }
-          if (!ageSynced && usageSynced) {
-            // Workers mode fallback: token is live even if age endpoint sync is unavailable.
-            await setTokenAgeVerified(c.env.DB, t, true);
-            refreshed = true;
           }
         }
         results[`sso=${t}`] = refreshed;
